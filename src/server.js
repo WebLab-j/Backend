@@ -1,12 +1,49 @@
 require("dotenv").config();
 const express = require("express");
+const cors = require("cors");
 const cron = require("node-cron");
 const { syncRange } = require("./services/syncService");
 
 const app = express();
+
+const allowedOrigins = [
+  "http://localhost:3000", // desarrollo
+  "https://analizador-frontend.vercel.app" // producción
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true); // permitir Postman o server-to-server
+    if (allowedOrigins.indexOf(origin) === -1) {
+      return callback(new Error("CORS not allowed"), false);
+    }
+    return callback(null, true);
+  },
+  methods: ["GET", "POST", "PUT", "DELETE"],
+  credentials: true
+}));
+
 app.use(express.json());
 const axios = require("axios");
 const { filterActividadesByWindow } = require("./utils/timeWindow");
+
+const allowedOrigins = [
+  "http://localhost:3000", // desarrollo
+  "https://analizador-frontend.vercel.app" // producción
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true); // permitir Postman o server-to-server
+    if (allowedOrigins.indexOf(origin) === -1) {
+      return callback(new Error("CORS not allowed"), false);
+    }
+    return callback(null, true);
+  },
+  methods: ["GET", "POST", "PUT", "DELETE"],
+  credentials: true
+}));
+
 
 
 app.get("/health", (req, res) => res.json({ ok: true }));
