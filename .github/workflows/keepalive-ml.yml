@@ -1,0 +1,14 @@
+name: keepalive-ml
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # cada 10 minutos
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping ML /health
+        run: |
+          curl -fsS https://ml-7tpx.onrender.com/health || true
