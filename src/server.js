@@ -8,7 +8,8 @@ const app = express();
 
 const allowedOrigins = [
   "http://localhost:3000", // desarrollo
-  "https://analizador-front.vercel.app" // producción
+  "https://analizador-front.vercel.app", // producción
+  "https://analizador-weblab.vercel.app"
 ];
 
 app.use(cors({
