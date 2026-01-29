@@ -14,6 +14,79 @@ const TZ = "America/Mexico_City";
 const START_HOUR = 9;
 const END_HOUR = 17; // exclusivo
 
+const USERS_SEARCH_URL =
+  process.env.WL_USERS_SEARCH_URL ||
+  "https://wlserver-production.up.railway.app/api/users/search";
+
+const ALLOW_DOMAINS = new Set(["pprin.com", "practicante.com"]);
+
+// cache en memoria: userId -> { email, name, ts }
+const userCache = new Map();
+const USER_TTL_MS = 24 * 60 * 60 * 1000;
+
+function domainOf(email) {
+  const e = String(email || "").trim().toLowerCase();
+  const at = e.lastIndexOf("@");
+  return at >= 0 ? e.slice(at + 1) : "";
+}
+function allowedByEmail(email) {
+  const dom = domainOf(email);
+  return ALLOW_DOMAINS.has(dom);
+}
+
+async function fetchUserByIdViaSearch(userId) {
+  if (!userId) return { email: "", name: "" };
+
+  // cache
+  const hit = userCache.get(userId);
+  if (hit && Date.now() - hit.ts < USER_TTL_MS) return hit;
+
+  try {
+    // usamos q=userId
+    const { data } = await axios.get(USERS_SEARCH_URL, { params: { q: userId } });
+
+    const items = Array.isArray(data?.items) ? data.items : [];
+    // intenta encontrar el que coincide por _id o id, si no, usa el primero
+    const u = items.find(x => x?._id === userId || x?.id === userId) || items[0] || null;
+
+    const email = u?.email || "";
+    const name =
+      [u?.firstName, u?.lastName].filter(Boolean).join(" ").trim() ||
+      u?.name ||
+      "";
+
+    const norm = { email, name, ts: Date.now() };
+    userCache.set(userId, norm);
+    return norm;
+  } catch (e) {
+    // cache negativo corto
+    const norm = { email: "", name: "", ts: Date.now() };
+    userCache.set(userId, norm);
+    return norm;
+  }
+}
+
+async function resolveUsersMap(userIds, concurrency = 4) {
+  const ids = Array.from(new Set(userIds)).filter(Boolean);
+  const out = new Map();
+  let i = 0;
+
+  async function worker() {
+    while (i < ids.length) {
+      const idx = i++;
+      const id = ids[idx];
+      const info = await fetchUserByIdViaSearch(id);
+      out.set(id, info);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, ids.length) }, () => worker());
+  await Promise.all(workers);
+  return out;
+}
+
+
+
 function getTodayISOInTZ(timeZone) {
   const now = new Date();
   const fmt = new Intl.DateTimeFormat("en-CA", {
@@ -313,33 +386,32 @@ async function procesarDia(day, useBusquedaLogic = false) {
     // ---- PASO 2: Obtener colaboradores y revisiones ----
     let colaboradores = await fetchColaboradores(day);
 
-    // ---- APLICAR FILTRO DE EXCLUSIÓN DE USUARIOS ----
-    colaboradores = colaboradores.filter((col) => {
-      const userId = col?.idAsignee;
 
-      if (EXCLUDE_USER_IDS.has(userId)) {
-        console.log(`[FILTRO] Excluyendo usuario por ID: ${userId}`);
-        return false;
-      }
-      if (EXCLUDE_USER_IDS2.has(userId)) {
-        console.log(`[FILTRO] Excluyendo usuario por ID: ${userId}`);
-        return false;
-      }
-      if (EXCLUDE_USER_IDS3.has(userId)) {
-        console.log(`[FILTRO] Excluyendo usuario por ID: ${userId}`);
-        return false;
-      }
+    //// Resolver emails por userId (solo usando /users/search)
+const userIds = colaboradores.map(c => c?.idAsignee).filter(Boolean);
+const usersInfo = await resolveUsersMap(userIds, 4); // baja a 2-3 si te da 429
 
-      if (col?.email) {
-        const domain = col.email.split("@")[1];
-        if (EXCLUDE_DOMAINS.has(domain)) {
-          console.log(`[FILTRO] Excluyendo usuario por dominio: ${domain}`);
-          return false;
-        }
-      }
+// Filtrar: SOLO permitir dominios pprin.com y practicante.com
+colaboradores = colaboradores.filter((col) => {
+  const userId = col?.idAsignee;
+  if (!userId) return false;
 
-      return true;
-    });
+  // tus exclusiones por ID siguen funcionando
+  if (EXCLUDE_USER_IDS.has(userId) || EXCLUDE_USER_IDS2.has(userId) || EXCLUDE_USER_IDS3.has(userId)) {
+    console.log(`[FILTRO] Excluyendo usuario por ID: ${userId}`);
+    return false;
+  }
+
+  const info = usersInfo.get(userId) || {};
+  const email = info.email || "";
+
+  if (!allowedByEmail(email)) {
+    console.log(`[FILTRO] Excluyendo por dominio. userId=${userId} email=${email}`);
+    return false;
+  }
+
+  return true;
+});
 
     // ---- PASO 3: Procesar cada colaborador (ELIGIENDO LA LÓGICA CORRECTA) ----
     let rows;
