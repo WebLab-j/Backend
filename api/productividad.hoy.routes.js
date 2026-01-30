@@ -447,6 +447,233 @@ colaboradores = colaboradores.filter((col) => {
   }
 }
 
+function safeArray(v) {
+  return Array.isArray(v) ? v : [];
+}
+
+function normalizeRevision(r) {
+  if (!r || typeof r !== "object") return null;
+
+  // "nombre" depende de tu API WL; si no existe, queda null.
+  const nombre = r.nombre ?? r.name ?? r.titulo ?? r.title ?? null;
+
+  return {
+    id: r.id ?? r._id ?? null,
+    nombre,
+    duracionMin: Number(r?.duracionMin ?? 0) || 0,
+    fechaCreacion: r.fechaCreacion ?? r.createdAt ?? null,
+    assignees: safeArray(r.assignees).map((a) => ({
+      id: a?.id ?? null,
+      name: a?.name ?? null,
+      email: a?.email ?? null,
+    })),
+    raw: r, // si no lo quieres, quítalo
+  };
+}
+
+function summarizeActividadBuckets(actividad) {
+  const buckets = ["terminadas", "confirmadas", "pendientes"];
+  const out = { revisiones: 0, con_duracion: 0, sin_duracion: 0, minutos: 0 };
+
+  for (const b of buckets) {
+    const revs = safeArray(actividad?.revisiones?.[b]);
+    for (const r of revs) {
+      out.revisiones += 1;
+      const dur = Number(r?.duracionMin ?? 0) || 0;
+      if (dur > 0) {
+        out.con_duracion += 1;
+        out.minutos += dur;
+      } else {
+        out.sin_duracion += 1;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * ✅ DETALLE:
+ * - HOY => usa dueStart 9-5 para filtrar ACTIVIDADES, y trae revisiones de esas actividades (sin filtrar fechaCreacion)
+ * - PASADO => usa fechaCreacion (y opcional 9-5) para filtrar REVISIONES del día
+ *
+ * Query opcional:
+ * - ?hours=work  => pasado: fechaCreacion 9-5
+ * - ?hours=all   => pasado: todo el día (solo por fecha)
+ */
+async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, hours = "all")
+ {
+  const isCurrentDay = isToday(day, TZ);
+  const useFechaCreacion = useBusquedaLogic || !isCurrentDay;
+
+  const actividadesById = await fetchActividades(day);
+  let colaboradores = await fetchColaboradores(day);
+
+  const info = await fetchUserByIdViaSearch(userId);
+
+  // Exclusiones
+  if (EXCLUDE_USER_IDS.has(userId) || EXCLUDE_USER_IDS2.has(userId) || EXCLUDE_USER_IDS3.has(userId)) {
+    return {
+      date: day,
+      user: { user_id: userId, colaborador: "", email: info.email || "" },
+      actividades: [],
+      resumen: { actividades: 0, revisiones: 0, revisiones_con_duracion: 0, revisiones_sin_duracion: 0, tiempo_total: 0 },
+      prediccion: null,
+      meta: { useFechaCreacion, isCurrentDay, reason: "excluded_id" },
+    };
+  }
+
+  if (!allowedByEmail(info.email || "")) {
+    return {
+      date: day,
+      user: { user_id: userId, colaborador: "", email: info.email || "" },
+      actividades: [],
+      resumen: { actividades: 0, revisiones: 0, revisiones_con_duracion: 0, revisiones_sin_duracion: 0, tiempo_total: 0 },
+      prediccion: null,
+      meta: { useFechaCreacion, isCurrentDay, reason: "excluded_domain" },
+    };
+  }
+
+  const col = colaboradores.find((c) => c?.idAsignee === userId) || null;
+
+  if (!col) {
+    return {
+      date: day,
+      user: { user_id: userId, colaborador: info.name || userId, email: info.email || "" },
+      actividades: [],
+      resumen: { actividades: 0, revisiones: 0, revisiones_con_duracion: 0, revisiones_sin_duracion: 0, tiempo_total: 0 },
+      prediccion: null,
+      meta: { useFechaCreacion, isCurrentDay, reason: "no_data" },
+    };
+  }
+
+  const userName = resolveUserName(col) || info.name || userId;
+  const acts = safeArray(col?.items?.actividades);
+  const buckets = ["terminadas", "confirmadas", "pendientes"];
+
+  // ✅ HOY: calcular actividades válidas por dueStart 9–5
+  const validActIdsHoy = new Set();
+  if (!useFechaCreacion) {
+    for (const a of acts) {
+      const actId = a?.id;
+      if (!actId) continue;
+
+      const sched = actividadesById.get(actId);
+      if (!sched) continue;
+
+      if (esFtf00secPorTitulo(sched.titulo)) continue;
+
+      const res = isDueStartBetween9and5Local(sched.dueStart, day, TZ);
+      if (res.ok) validActIdsHoy.add(actId);
+    }
+  }
+
+  // ✅ PASADO: filtro de revisiones por fechaCreacion del día (+ horario si hours=work)
+const passRevisionFilterPasado = (rev) => {
+  const fc = rev?.fechaCreacion ?? rev?.createdAt ?? null;
+  if (!fc) return false;
+
+  const local = getLocalParts(new Date(fc), TZ);
+  if (!local || local.date !== day) return false; // ✅ mismo día
+
+  // ✅ si quieres opcional 9-5, solo cuando hours=work
+  if (hours === "work") {
+    return isFechaCreacionBetween9and5Local(fc, day, TZ).ok;
+  }
+
+  return true; // ✅ hours=all => todo el día
+};
+
+  const actividadesDetalle = [];
+
+  for (const a of acts) {
+    const actId = a?.id;
+    if (!actId) continue;
+
+    const sched = actividadesById.get(actId);
+    const titulo = sched?.titulo || a?.titulo || "";
+
+    if (esFtf00secPorTitulo(titulo)) continue;
+
+    // ✅ HOY: solo actividades válidas por dueStart
+    if (!useFechaCreacion && !validActIdsHoy.has(actId)) continue;
+
+const revisiones = { terminadas: [], confirmadas: [], pendientes: [] };
+
+if (useFechaCreacion) {
+  // ✅ HISTORIAL: SOLO TERMINADAS y SIN FILTROS (ni hora ni fechaCreacion)
+  const terminadas = safeArray(a?.terminadas);
+
+  for (const r of terminadas) {
+    const norm = normalizeRevision(r);
+    if (norm) revisiones.terminadas.push(norm);
+  }
+} else {
+  // ✅ HOY: trae TODO lo que venga (terminadas/confirmadas/pendientes)
+  for (const b of buckets) {
+    const revs = safeArray(a?.[b]);
+    for (const r of revs) {
+      const norm = normalizeRevision(r);
+      if (norm) revisiones[b].push(norm);
+    }
+  }
+}
+
+
+
+    const total =
+      revisiones.terminadas.length + revisiones.confirmadas.length + revisiones.pendientes.length;
+
+    // si no hay revisiones del día (pasado), no incluyas la actividad
+    if (total === 0) continue;
+
+    actividadesDetalle.push({
+      id: actId,
+      titulo,
+      dueStart: sched?.dueStart ?? null,
+      revisiones,
+    });
+  }
+
+  // Resumen
+  let revisionesCount = 0;
+  let conDur = 0;
+  let sinDur = 0;
+  let minutos = 0;
+
+  for (const act of actividadesDetalle) {
+    const s = summarizeActividadBuckets(act);
+    revisionesCount += s.revisiones;
+    conDur += s.con_duracion;
+    sinDur += s.sin_duracion;
+    minutos += s.minutos;
+  }
+
+  const features = {
+    actividades: actividadesDetalle.length,
+    revisiones_con_duracion: conDur,
+    revisiones_sin_duracion: sinDur,
+    tiempo_total: minutos,
+  };
+
+  const prediccion = await predecirConModelo(features);
+
+  return {
+    date: day,
+    user: { user_id: userId, colaborador: userName, email: info.email || "" },
+    resumen: {
+      actividades: features.actividades,
+      revisiones: revisionesCount,
+      revisiones_con_duracion: conDur,
+      revisiones_sin_duracion: sinDur,
+      tiempo_total: minutos,
+    },
+    prediccion,
+    actividades: actividadesDetalle,
+    meta: { useFechaCreacion, isCurrentDay, hours },
+  };
+}
+
+
 // ✅ RUTA 1: Un día específico
 /**
  * GET /api/productividad/hoy (sin ?date) → Hoy en vivo con dueStart
@@ -515,5 +742,28 @@ router.get("/rango", async (req, res) => {
     return res.status(500).json({ error: msg });
   }
 });
+
+router.get("/usuario/:userId", async (req, res) => {
+  try {
+    const userId = String(req.params.userId || "").trim();
+    if (!userId) return res.status(400).json({ error: "userId requerido" });
+
+    const dateParam = String(req.query.date || "").trim();
+    const day = dateParam || getTodayISOInTZ(TZ);
+
+    // ✅ Si el día pedido ES HOY, NO forzar búsqueda.
+    const isCurrentDay = isToday(day, TZ);
+    const useBusquedaLogic = !!dateParam && !isCurrentDay;
+
+    // hours solo aplica para pasado; para hoy lo ignoramos (da igual)
+    const hours = String(req.query.hours || "work").trim();
+
+    const detalle = await procesarDetalleUsuarioDia(userId, day, useBusquedaLogic, hours);
+    return res.json(detalle);
+  } catch (err) {
+    return res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
 
 module.exports = router;
