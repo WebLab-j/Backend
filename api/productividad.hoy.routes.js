@@ -1,5 +1,4 @@
-
-
+// /routes/productividad.js
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
@@ -7,11 +6,14 @@ const axios = require("axios");
 const router = express.Router();
 
 const DEFAULT_ACT_URL = "https://wlserver-production-6735.up.railway.app/api/actividades";
-const DEFAULT_REV_URL ="https://wlserver-production-6735.up.railway.app/api/reportes/revisiones-por-fecha";
+const DEFAULT_REV_URL =
+  "https://wlserver-production-6735.up.railway.app/api/reportes/revisiones-por-fecha";
 
 const TZ = "America/Mexico_City";
 const START_HOUR = 9;
 const END_HOUR = 17; // exclusivo
+const START_MIN = START_HOUR * 60;
+const END_MIN = END_HOUR * 60;
 
 const USERS_SEARCH_URL =
   process.env.WL_USERS_SEARCH_URL ||
@@ -19,47 +21,171 @@ const USERS_SEARCH_URL =
 
 const ALLOW_DOMAINS = new Set(["pprin.com", "practicante.com"]);
 
+// ---- caches ----
+
 // cache en memoria: userId -> { email, name, ts }
 const userCache = new Map();
 const USER_TTL_MS = 24 * 60 * 60 * 1000;
+
+// cache nombre en memoria: userId -> name
+const userNameCache = new Map();
+
+// cache actividades por día con TTL
+const actividadesCache = new Map(); // day -> { byId: Map, ts }
+const ACT_CACHE_TTL_MS = 5 * 60 * 1000;
+
+// cache localParts: key -> {date,hour,minute}
+const localPartsCache = new Map();
+const LOCAL_PARTS_CACHE_MAX = 50_000;
+
+function pruneMapToMaxSize(map, max) {
+  if (map.size <= max) return;
+  const over = map.size - max;
+  let i = 0;
+  for (const k of map.keys()) {
+    map.delete(k);
+    if (++i >= over) break;
+  }
+}
+
+// ---- domain helpers ----
 
 function domainOf(email) {
   const e = String(email || "").trim().toLowerCase();
   const at = e.lastIndexOf("@");
   return at >= 0 ? e.slice(at + 1) : "";
 }
+
 function allowedByEmail(email) {
-  const dom = domainOf(email);
-  return ALLOW_DOMAINS.has(dom);
+  return ALLOW_DOMAINS.has(domainOf(email));
 }
+
+// ---- Intl formatters (reuse) ----
+
+const todayFmtByTz = new Map();
+function getTodayFormatter(timeZone) {
+  let fmt = todayFmtByTz.get(timeZone);
+  if (!fmt) {
+    fmt = new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+    todayFmtByTz.set(timeZone, fmt);
+  }
+  return fmt;
+}
+
+const partsFmtByTz = new Map();
+function getPartsFormatter(timeZone) {
+  let fmt = partsFmtByTz.get(timeZone);
+  if (!fmt) {
+    fmt = new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+      hourCycle: "h23",
+    });
+    partsFmtByTz.set(timeZone, fmt);
+  }
+  return fmt;
+}
+
+function getTodayISOInTZ(timeZone) {
+  return getTodayFormatter(timeZone).format(new Date());
+}
+
+function getLocalParts(dateObj, timeZone) {
+  if (!(dateObj instanceof Date) || Number.isNaN(dateObj.getTime())) return null;
+
+  const ms = dateObj.getTime();
+  const key = `${timeZone}|${ms}`;
+
+  const cached = localPartsCache.get(key);
+  if (cached) return cached;
+
+  const fmt = getPartsFormatter(timeZone);
+  const parts = fmt.formatToParts(dateObj);
+
+  let y, m, d, h, min;
+  for (const p of parts) {
+    if (p.type === "year") y = p.value;
+    else if (p.type === "month") m = p.value;
+    else if (p.type === "day") d = p.value;
+    else if (p.type === "hour") h = p.value;
+    else if (p.type === "minute") min = p.value;
+  }
+
+  if (!y || !m || !d || h == null || min == null) return null;
+
+  const value = { date: `${y}-${m}-${d}`, hour: Number(h), minute: Number(min) };
+  localPartsCache.set(key, value);
+  pruneMapToMaxSize(localPartsCache, LOCAL_PARTS_CACHE_MAX);
+  return value;
+}
+
+function isBetweenWorkHoursLocal(dateStr, day, timeZone, noDateReason) {
+  if (!dateStr) return { ok: false, reason: noDateReason };
+
+  const dt = new Date(dateStr);
+  const local = getLocalParts(dt, timeZone);
+  if (!local) return { ok: false, reason: "bad_date" };
+
+  if (local.date !== day) return { ok: false, reason: "date_mismatch" };
+
+  const minutes = local.hour * 60 + local.minute;
+  if (minutes < START_MIN) return { ok: false, reason: "before_9" };
+  if (minutes >= END_MIN) return { ok: false, reason: "after_5" };
+
+  return { ok: true, reason: "ok" };
+}
+
+// ---- FILTRO 1: dueStart ----
+function isDueStartBetween9and5Local(dueStartStr, day, timeZone) {
+  return isBetweenWorkHoursLocal(dueStartStr, day, timeZone, "no_dueStart");
+}
+
+// ---- FILTRO 2: fechaCreacion ----
+function isFechaCreacionBetween9and5Local(fechaCreacionStr, day, timeZone) {
+  return isBetweenWorkHoursLocal(fechaCreacionStr, day, timeZone, "no_fechaCreacion");
+}
+
+// regex precompilado
+const ftfRegex = /ftf|00sec/i;
+function esFtf00secPorTitulo(titulo) {
+  return ftfRegex.test(String(titulo ?? ""));
+}
+
+// ---- user fetching ----
 
 async function fetchUserByIdViaSearch(userId) {
   if (!userId) return { email: "", name: "" };
 
-  // cache
   const hit = userCache.get(userId);
-  if (hit && Date.now() - hit.ts < USER_TTL_MS) return hit;
+  const now = Date.now();
+  if (hit && now - hit.ts < USER_TTL_MS) return hit;
 
   try {
-    // usamos q=userId
     const { data } = await axios.get(USERS_SEARCH_URL, { params: { q: userId } });
 
     const items = Array.isArray(data?.items) ? data.items : [];
-    // intenta encontrar el que coincide por _id o id, si no, usa el primero
-    const u = items.find(x => x?._id === userId || x?.id === userId) || items[0] || null;
+    const u =
+      items.find((x) => x?._id === userId || x?.id === userId) || items[0] || null;
 
     const email = u?.email || "";
     const name =
-      [u?.firstName, u?.lastName].filter(Boolean).join(" ").trim() ||
-      u?.name ||
-      "";
+      [u?.firstName, u?.lastName].filter(Boolean).join(" ").trim() || u?.name || "";
 
-    const norm = { email, name, ts: Date.now() };
+    const norm = { email, name, ts: now };
     userCache.set(userId, norm);
     return norm;
-  } catch (e) {
-    // cache negativo corto
-    const norm = { email: "", name: "", ts: Date.now() };
+  } catch {
+    const norm = { email: "", name: "", ts: now };
     userCache.set(userId, norm);
     return norm;
   }
@@ -84,115 +210,46 @@ async function resolveUsersMap(userIds, concurrency = 4) {
   return out;
 }
 
-
-
-function getTodayISOInTZ(timeZone) {
-  const now = new Date();
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  return fmt.format(now);
-}
-
-function getLocalParts(dateObj, timeZone) {
-  if (!(dateObj instanceof Date) || Number.isNaN(dateObj.getTime())) return null;
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-    hourCycle: "h23",
-  });
-  const parts = fmt.formatToParts(dateObj);
-  const get = (type) => parts.find((p) => p.type === type)?.value;
-
-  const y = get("year");
-  const m = get("month");
-  const d = get("day");
-  const h = get("hour");
-  const min = get("minute");
-  if (!y || !m || !d || h == null || min == null) return null;
-
-  return { date: `${y}-${m}-${d}`, hour: Number(h), minute: Number(min) };
-}
-
-// ---- FILTRO 1: Por dueStart (PROGRAMADA para hoy, para tiempo real) ----
-function isDueStartBetween9and5Local(dueStartStr, day, timeZone) {
-  if (!dueStartStr) return { ok: false, reason: "no_dueStart" };
-
-  const dt = new Date(dueStartStr);
-  const local = getLocalParts(dt, timeZone);
-  if (!local) return { ok: false, reason: "bad_date" };
-
-  // Debe ser el mismo día
-  if (local.date !== day) return { ok: false, reason: `date_mismatch` };
-
-  const minutes = local.hour * 60 + local.minute;
-  const start = START_HOUR * 60; // 540 (9:00)
-  const end = END_HOUR * 60; // 1020 (17:00)
-
-  if (minutes < start) return { ok: false, reason: `before_9` };
-  if (minutes >= end) return { ok: false, reason: `after_5` };
-
-  return { ok: true, reason: "ok" };
-}
-
-// ---- FILTRO 2: Por fechaCreacion (CUANDO SE HIZO la revisión, para búsqueda específica) ----
-function isFechaCreacionBetween9and5Local(fechaCreacionStr, day, timeZone) {
-  if (!fechaCreacionStr) return { ok: false, reason: "no_fechaCreacion" };
-
-  const dt = new Date(fechaCreacionStr);
-  const local = getLocalParts(dt, timeZone);
-  if (!local) return { ok: false, reason: "bad_date" };
-
-  // Debe ser el mismo día
-  if (local.date !== day) return { ok: false, reason: `date_mismatch` };
-
-  const minutes = local.hour * 60 + local.minute;
-  const start = START_HOUR * 60; // 540 (9:00)
-  const end = END_HOUR * 60; // 1020 (17:00)
-
-  if (minutes < start) return { ok: false, reason: `before_9` };
-  if (minutes >= end) return { ok: false, reason: `after_5` };
-
-  return { ok: true, reason: "ok" };
-}
-
-function esFtf00secPorTitulo(titulo) {
-  const t = String(titulo ?? "").toLowerCase();
-  return t.includes("ftf") || t.includes("00sec");
-}
+// ---- resolve user name (cache) ----
 
 function resolveUserName(col) {
   if (col?.name) return col.name;
 
   const userId = col?.idAsignee;
-  const acts = Array.isArray(col?.items?.actividades) ? col.items.actividades : [];
+  if (!userId) return "unknown";
 
+  const cached = userNameCache.get(userId);
+  if (cached) return cached;
+
+  const acts = Array.isArray(col?.items?.actividades) ? col.items.actividades : [];
   for (const a of acts) {
     for (const bucket of ["terminadas", "confirmadas", "pendientes"]) {
       const revs = Array.isArray(a?.[bucket]) ? a[bucket] : [];
       for (const r of revs) {
         const asg = Array.isArray(r?.assignees) ? r.assignees : [];
         const hit = asg.find((x) => x?.id === userId && x?.name);
-        if (hit?.name) return hit.name;
+        if (hit?.name) {
+          userNameCache.set(userId, hit.name);
+          return hit.name;
+        }
       }
     }
   }
-  return userId || "unknown";
+
+  const fallback = userId || "unknown";
+  userNameCache.set(userId, fallback);
+  return fallback;
 }
 
+// ---- data fetching ----
+
 async function fetchActividades(day) {
+  const cached = actividadesCache.get(day);
+  const now = Date.now();
+  if (cached && now - cached.ts < ACT_CACHE_TTL_MS) return cached.byId;
+
   const actUrl = process.env.WL_ACTIVIDADES_URL || DEFAULT_ACT_URL;
-  const { data } = await axios.get(actUrl, {
-    params: { start: day, end: day },
-  });
+  const { data } = await axios.get(actUrl, { params: { start: day, end: day } });
 
   const list = Array.isArray(data?.data) ? data.data : [];
   const byId = new Map();
@@ -206,6 +263,7 @@ async function fetchActividades(day) {
     });
   }
 
+  actividadesCache.set(day, { byId, ts: now });
   return byId;
 }
 
@@ -217,61 +275,45 @@ async function fetchColaboradores(day) {
 
 // ✅ DETERMINAR SI ES HOY O UNA BÚSQUEDA ESPECÍFICA
 function isToday(dateStr, timeZone) {
-  const today = getTodayISOInTZ(timeZone);
-  return dateStr === today;
+  return dateStr === getTodayISOInTZ(timeZone);
 }
 
-// ✅ VERSIÓN 1: LÓGICA PARA HOY (tiempo real con dueStart)
+// ---- HOY (misma lógica, optimizada: 1 pasada) ----
 function procesarColaboradorDia_HOY(col, day, actividadesById) {
   const userId = col?.idAsignee;
   if (!userId) return null;
 
   const userName = resolveUserName(col);
 
-  // ---- PASO 1: Obtener IDs de actividades válidas (programadas 9-5 con dueStart) ----
   const validActIds = new Set();
-
-  const acts = Array.isArray(col?.items?.actividades) ? col.items.actividades : [];
-  for (const a of acts) {
-    const actId = a?.id;
-    if (!actId) continue;
-
-    // Obtener datos de la actividad
-    const sched = actividadesById.get(actId);
-    if (!sched) continue; // No encontrada en /actividades
-
-    // Excluir ftf/00sec
-    if (esFtf00secPorTitulo(sched.titulo)) continue;
-
-    // FILTRAR POR dueStart (9-5, programado para HOY)
-    const res = isDueStartBetween9and5Local(sched.dueStart, day, TZ);
-    if (res.ok) {
-      validActIds.add(actId);
-    }
-  }
-
-  // ---- PASO 2: Contar revisiones SOLO de actividades válidas ----
   let revisiones = 0;
   let revisiones_con_duracion = 0;
   let revisiones_sin_duracion = 0;
   let minutos = 0;
 
+  const acts = Array.isArray(col?.items?.actividades) ? col.items.actividades : [];
   const buckets = ["terminadas", "confirmadas", "pendientes"];
 
   for (const a of acts) {
     const actId = a?.id;
-    // SOLO procesar actividades válidas
-    if (!actId || !validActIds.has(actId)) continue;
+    if (!actId) continue;
+
+    const sched = actividadesById.get(actId);
+    if (!sched) continue;
+
+    if (esFtf00secPorTitulo(sched.titulo)) continue;
+
+    const res = isDueStartBetween9and5Local(sched.dueStart, day, TZ);
+    if (!res.ok) continue;
+
+    validActIds.add(actId);
 
     for (const b of buckets) {
       const revs = Array.isArray(a?.[b]) ? a[b] : [];
       for (const r of revs) {
         const dur = Number(r?.duracionMin ?? 0) || 0;
-
-        // Contar TODA revisión de actividad válida
         revisiones += 1;
 
-        // Diferenciar por duración
         if (dur > 0) {
           revisiones_con_duracion += 1;
           minutos += dur;
@@ -294,8 +336,7 @@ function procesarColaboradorDia_HOY(col, day, actividadesById) {
   };
 }
 
-// ✅ VERSIÓN 2 SIN FILTRO DE FECHA/HORA
-// Cuenta TODO lo que venga en "terminadas", sin importar día ni horario.
+// ---- BÚSQUEDA (misma lógica) ----
 function procesarColaboradorDia_BUSQUEDA(col, day, actividadesById) {
   const userId = col?.idAsignee;
   if (!userId) return null;
@@ -317,7 +358,6 @@ function procesarColaboradorDia_BUSQUEDA(col, day, actividadesById) {
     const sched = actividadesById.get(actId);
     const titulo = sched?.titulo || a?.titulo || "";
 
-    // Si también quieres quitar este filtro, borra estas 2 líneas:
     if (esFtf00secPorTitulo(titulo)) continue;
 
     const terminadas = Array.isArray(a?.terminadas) ? a.terminadas : [];
@@ -339,7 +379,7 @@ function procesarColaboradorDia_BUSQUEDA(col, day, actividadesById) {
   }
 
   return {
-    date: day, // queda informativo; ya no se usa para filtrar
+    date: day,
     user_id: userId,
     colaborador: userName,
     actividades: actividadesValidas.size,
@@ -349,8 +389,6 @@ function procesarColaboradorDia_BUSQUEDA(col, day, actividadesById) {
     tiempo_total: minutos,
   };
 }
-
-
 
 async function predecirConModelo(features) {
   const mlBase = process.env.ML_API_BASE || "http://127.0.0.1:8000";
@@ -365,84 +403,100 @@ async function predecirConModelo(features) {
 }
 
 // ---- FILTRO DE USUARIOS (exclusión) ----
-const EXCLUDE_DOMAINS = new Set(["officlean.com", "aluvri.com"]);
+const EXCLUDE_DOMAINS = new Set(["officlean.com", "aluvri.com"]); // (se mantiene aunque no se use)
 const EXCLUDE_USER_IDS = new Set(["2dad872b594c81c8ae6500026864f907"]);
 const EXCLUDE_USER_IDS2 = new Set(["2e6d872b594c8100ac680002df5d84c5"]);
 const EXCLUDE_USER_IDS3 = new Set(["2edd872b594c818984190002be5174f1"]);
 
-// ✅ FUNCIÓN AUXILIAR: Procesar un día (reutilizada por /hoy y /rango)
+// Unificado (más rápido, misma lógica)
+const ALL_EXCLUDED_IDS = new Set([...EXCLUDE_USER_IDS, ...EXCLUDE_USER_IDS2, ...EXCLUDE_USER_IDS3]);
+
+// ---- Concurrency helper (sin deps) ----
+async function mapLimit(items, limit, mapper) {
+  const out = new Array(items.length);
+  let idx = 0;
+
+  async function worker() {
+    while (idx < items.length) {
+      const current = idx++;
+      out[current] = await mapper(items[current], current);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+  await Promise.all(workers);
+  return out;
+}
+
+// ✅ FUNCIÓN AUXILIAR: Procesar un día
 async function procesarDia(day, useBusquedaLogic = false) {
   try {
-    // DETECTAR LÓGICA A USAR
     const isCurrentDay = isToday(day, TZ);
     const useFechaCreacion = useBusquedaLogic || !isCurrentDay;
-    
-    console.log(`[procesarDia] ${day} - isCurrentDay: ${isCurrentDay} - useFechaCreacion: ${useFechaCreacion}`);
 
-    // ---- PASO 1: Obtener actividades del día ----
-    const actividadesById = await fetchActividades(day);
+    console.log(
+      `[procesarDia] ${day} - isCurrentDay: ${isCurrentDay} - useFechaCreacion: ${useFechaCreacion}`
+    );
 
-    // ---- PASO 2: Obtener colaboradores y revisiones ----
-    let colaboradores = await fetchColaboradores(day);
+    // ✅ paralelo (misma data)
+    const [actividadesById, colaboradoresRaw] = await Promise.all([
+      fetchActividades(day),
+      fetchColaboradores(day),
+    ]);
 
+    let colaboradores = colaboradoresRaw;
 
-    //// Resolver emails por userId (solo usando /users/search)
-const userIds = colaboradores.map(c => c?.idAsignee).filter(Boolean);
-const usersInfo = await resolveUsersMap(userIds, 4); // baja a 2-3 si te da 429
+    // Resolver emails por userId
+    const userIds = colaboradores.map((c) => c?.idAsignee).filter(Boolean);
+    const usersInfo = await resolveUsersMap(userIds, Number(process.env.USERS_CONCURRENCY || 4));
 
-// Filtrar: SOLO permitir dominios pprin.com y practicante.com
-colaboradores = colaboradores.filter((col) => {
-  const userId = col?.idAsignee;
-  if (!userId) return false;
+    // Filtrar dominios + IDs (misma lógica)
+    colaboradores = colaboradores.filter((col) => {
+      const userId = col?.idAsignee;
+      if (!userId) return false;
 
-  // tus exclusiones por ID siguen funcionando
-  if (EXCLUDE_USER_IDS.has(userId) || EXCLUDE_USER_IDS2.has(userId) || EXCLUDE_USER_IDS3.has(userId)) {
-    console.log(`[FILTRO] Excluyendo usuario por ID: ${userId}`);
-    return false;
-  }
+      if (ALL_EXCLUDED_IDS.has(userId)) {
+        console.log(`[FILTRO] Excluyendo usuario por ID: ${userId}`);
+        return false;
+      }
 
-  const info = usersInfo.get(userId) || {};
-  const email = info.email || "";
+      const info = usersInfo.get(userId) || {};
+      const email = info.email || "";
 
-  if (!allowedByEmail(email)) {
-    console.log(`[FILTRO] Excluyendo por dominio. userId=${userId} email=${email}`);
-    return false;
-  }
+      if (!allowedByEmail(email)) {
+        console.log(`[FILTRO] Excluyendo por dominio. userId=${userId} email=${email}`);
+        return false;
+      }
 
-  return true;
-});
+      return true;
+    });
 
-    // ---- PASO 3: Procesar cada colaborador (ELIGIENDO LA LÓGICA CORRECTA) ----
     let rows;
     if (useFechaCreacion) {
-      // BÚSQUEDA: Usar fechaCreacion (lo que se hizo realmente ese día)
       console.log(`[procesarDia] Usando lógica BÚSQUEDA (fechaCreacion)`);
       rows = colaboradores
         .map((c) => procesarColaboradorDia_BUSQUEDA(c, day, actividadesById))
         .filter(Boolean);
     } else {
-      // HOY: Usar dueStart (lo programado para hoy)
       console.log(`[procesarDia] Usando lógica HOY (dueStart)`);
       rows = colaboradores
         .map((c) => procesarColaboradorDia_HOY(c, day, actividadesById))
         .filter(Boolean);
     }
 
-    // ---- PASO 4: Predicción por usuario (paralelo) ----
-    const users = await Promise.all(
-      rows.map(async (r) => ({
-        ...r,
-        prediccion: await predecirConModelo(r),
-      }))
-    );
+    // ✅ Limitar concurrencia ML (misma salida, menos saturación)
+    const mlConcurrency = Number(process.env.ML_CONCURRENCY || 6);
+    const users = await mapLimit(rows, mlConcurrency, async (r) => ({
+      ...r,
+      prediccion: await predecirConModelo(r),
+    }));
 
-    // Ordena por minutos desc
     users.sort((a, b) => (b.tiempo_total || 0) - (a.tiempo_total || 0));
 
     return { date: day, users };
   } catch (err) {
-    console.error(`[procesarDia] Error en ${day}:`, err.message);
-    return { date: day, users: [], error: err.message };
+    console.error(`[procesarDia] Error en ${day}:`, err?.message || err);
+    return { date: day, users: [], error: err?.message || String(err) };
   }
 }
 
@@ -453,7 +507,6 @@ function safeArray(v) {
 function normalizeRevision(r) {
   if (!r || typeof r !== "object") return null;
 
-  // "nombre" depende de tu API WL; si no existe, queda null.
   const nombre = r.nombre ?? r.name ?? r.titulo ?? r.title ?? null;
 
   return {
@@ -466,7 +519,7 @@ function normalizeRevision(r) {
       name: a?.name ?? null,
       email: a?.email ?? null,
     })),
-    raw: r, // si no lo quieres, quítalo
+    raw: r,
   };
 }
 
@@ -490,32 +543,29 @@ function summarizeActividadBuckets(actividad) {
   return out;
 }
 
-/**
- * ✅ DETALLE:
- * - HOY => usa dueStart 9-5 para filtrar ACTIVIDADES, y trae revisiones de esas actividades (sin filtrar fechaCreacion)
- * - PASADO => usa fechaCreacion (y opcional 9-5) para filtrar REVISIONES del día
- *
- * Query opcional:
- * - ?hours=work  => pasado: fechaCreacion 9-5
- * - ?hours=all   => pasado: todo el día (solo por fecha)
- */
-async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, hours = "all")
- {
+async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, hours = "all") {
   const isCurrentDay = isToday(day, TZ);
   const useFechaCreacion = useBusquedaLogic || !isCurrentDay;
 
-  const actividadesById = await fetchActividades(day);
-  let colaboradores = await fetchColaboradores(day);
+  // ✅ paralelo
+  const [actividadesById, colaboradores, info] = await Promise.all([
+    fetchActividades(day),
+    fetchColaboradores(day),
+    fetchUserByIdViaSearch(userId),
+  ]);
 
-  const info = await fetchUserByIdViaSearch(userId);
-
-  // Exclusiones
-  if (EXCLUDE_USER_IDS.has(userId) || EXCLUDE_USER_IDS2.has(userId) || EXCLUDE_USER_IDS3.has(userId)) {
+  if (ALL_EXCLUDED_IDS.has(userId)) {
     return {
       date: day,
       user: { user_id: userId, colaborador: "", email: info.email || "" },
       actividades: [],
-      resumen: { actividades: 0, revisiones: 0, revisiones_con_duracion: 0, revisiones_sin_duracion: 0, tiempo_total: 0 },
+      resumen: {
+        actividades: 0,
+        revisiones: 0,
+        revisiones_con_duracion: 0,
+        revisiones_sin_duracion: 0,
+        tiempo_total: 0,
+      },
       prediccion: null,
       meta: { useFechaCreacion, isCurrentDay, reason: "excluded_id" },
     };
@@ -526,7 +576,13 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
       date: day,
       user: { user_id: userId, colaborador: "", email: info.email || "" },
       actividades: [],
-      resumen: { actividades: 0, revisiones: 0, revisiones_con_duracion: 0, revisiones_sin_duracion: 0, tiempo_total: 0 },
+      resumen: {
+        actividades: 0,
+        revisiones: 0,
+        revisiones_con_duracion: 0,
+        revisiones_sin_duracion: 0,
+        tiempo_total: 0,
+      },
       prediccion: null,
       meta: { useFechaCreacion, isCurrentDay, reason: "excluded_domain" },
     };
@@ -539,7 +595,13 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
       date: day,
       user: { user_id: userId, colaborador: info.name || userId, email: info.email || "" },
       actividades: [],
-      resumen: { actividades: 0, revisiones: 0, revisiones_con_duracion: 0, revisiones_sin_duracion: 0, tiempo_total: 0 },
+      resumen: {
+        actividades: 0,
+        revisiones: 0,
+        revisiones_con_duracion: 0,
+        revisiones_sin_duracion: 0,
+        tiempo_total: 0,
+      },
       prediccion: null,
       meta: { useFechaCreacion, isCurrentDay, reason: "no_data" },
     };
@@ -549,7 +611,6 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
   const acts = safeArray(col?.items?.actividades);
   const buckets = ["terminadas", "confirmadas", "pendientes"];
 
-  // ✅ HOY: calcular actividades válidas por dueStart 9–5
   const validActIdsHoy = new Set();
   if (!useFechaCreacion) {
     for (const a of acts) {
@@ -566,21 +627,18 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
     }
   }
 
-  // ✅ PASADO: filtro de revisiones por fechaCreacion del día (+ horario si hours=work)
-const passRevisionFilterPasado = (rev) => {
-  const fc = rev?.fechaCreacion ?? rev?.createdAt ?? null;
-  if (!fc) return false;
+  // Se mantiene (aunque no se use) para no alterar estructura/intención
+  const passRevisionFilterPasado = (rev) => {
+    const fc = rev?.fechaCreacion ?? rev?.createdAt ?? null;
+    if (!fc) return false;
 
-  const local = getLocalParts(new Date(fc), TZ);
-  if (!local || local.date !== day) return false; // ✅ mismo día
+    const local = getLocalParts(new Date(fc), TZ);
+    if (!local || local.date !== day) return false;
 
-  // ✅ si quieres opcional 9-5, solo cuando hours=work
-  if (hours === "work") {
-    return isFechaCreacionBetween9and5Local(fc, day, TZ).ok;
-  }
-
-  return true; // ✅ hours=all => todo el día
-};
+    if (hours === "work") return isFechaCreacionBetween9and5Local(fc, day, TZ).ok;
+    return true;
+  };
+  void passRevisionFilterPasado;
 
   const actividadesDetalle = [];
 
@@ -592,37 +650,29 @@ const passRevisionFilterPasado = (rev) => {
     const titulo = sched?.titulo || a?.titulo || "";
 
     if (esFtf00secPorTitulo(titulo)) continue;
-
-    // ✅ HOY: solo actividades válidas por dueStart
     if (!useFechaCreacion && !validActIdsHoy.has(actId)) continue;
 
-const revisiones = { terminadas: [], confirmadas: [], pendientes: [] };
+    const revisiones = { terminadas: [], confirmadas: [], pendientes: [] };
 
-if (useFechaCreacion) {
-  // ✅ HISTORIAL: SOLO TERMINADAS y SIN FILTROS (ni hora ni fechaCreacion)
-  const terminadas = safeArray(a?.terminadas);
-
-  for (const r of terminadas) {
-    const norm = normalizeRevision(r);
-    if (norm) revisiones.terminadas.push(norm);
-  }
-} else {
-  // ✅ HOY: trae TODO lo que venga (terminadas/confirmadas/pendientes)
-  for (const b of buckets) {
-    const revs = safeArray(a?.[b]);
-    for (const r of revs) {
-      const norm = normalizeRevision(r);
-      if (norm) revisiones[b].push(norm);
+    if (useFechaCreacion) {
+      const terminadas = safeArray(a?.terminadas);
+      for (const r of terminadas) {
+        const norm = normalizeRevision(r);
+        if (norm) revisiones.terminadas.push(norm);
+      }
+    } else {
+      for (const b of buckets) {
+        const revs = safeArray(a?.[b]);
+        for (const r of revs) {
+          const norm = normalizeRevision(r);
+          if (norm) revisiones[b].push(norm);
+        }
+      }
     }
-  }
-}
-
-
 
     const total =
       revisiones.terminadas.length + revisiones.confirmadas.length + revisiones.pendientes.length;
 
-    // si no hay revisiones del día (pasado), no incluyas la actividad
     if (total === 0) continue;
 
     actividadesDetalle.push({
@@ -633,7 +683,6 @@ if (useFechaCreacion) {
     });
   }
 
-  // Resumen
   let revisionesCount = 0;
   let conDur = 0;
   let sinDur = 0;
@@ -672,35 +721,21 @@ if (useFechaCreacion) {
   };
 }
 
-
-// ✅ RUTA 1: Un día específico
-/**
- * GET /api/productividad/hoy (sin ?date) → Hoy en vivo con dueStart
- * GET /api/productividad/hoy?date=2025-01-25 → Búsqueda específica con fechaCreacion
- */
+// ✅ RUTA 1
 router.get("/hoy", async (req, res) => {
   try {
     const dateParam = String(req.query.date || "").trim();
     const day = dateParam || getTodayISOInTZ(TZ);
-    
-    // Si pasó un ?date específico, usar lógica de BÚSQUEDA
     const useBusquedaLogic = !!dateParam;
-    
+
     const resultado = await procesarDia(day, useBusquedaLogic);
     return res.json({ date: resultado.date, users: resultado.users });
   } catch (err) {
-    const msg = err?.message || String(err);
-    return res.status(500).json({ error: msg });
+    return res.status(500).json({ error: err?.message || String(err) });
   }
 });
 
-// ✅ RUTA 2: Rango de fechas
-/**
- * GET /api/productividad/rango?start=YYYY-MM-DD&end=YYYY-MM-DD
- * - Itera cada día del rango
- * - Automáticamente detecta: si es HOY usa dueStart, si es pasado usa fechaCreacion
- * - Devuelve array de días con usuarios procesados
- */
+// ✅ RUTA 2
 router.get("/rango", async (req, res) => {
   try {
     const start = String(req.query.start || "").trim();
@@ -710,22 +745,19 @@ router.get("/rango", async (req, res) => {
       return res.status(400).json({ error: "start y end son requeridos (YYYY-MM-DD)" });
     }
 
-    // Generar array de fechas
     const fechas = [];
     const inicioDate = new Date(start);
     const finDate = new Date(end);
 
     for (let d = new Date(inicioDate); d <= finDate; d.setDate(d.getDate() + 1)) {
-      const fechaStr = d.toISOString().slice(0, 10);
-      fechas.push(fechaStr);
+      fechas.push(d.toISOString().slice(0, 10));
     }
 
     console.log(`[Rango] Procesando ${fechas.length} días desde ${start} hasta ${end}`);
 
-    // Procesar cada día en paralelo (lógica automática: HOY vs BÚSQUEDA)
-    const dataPorDia = await Promise.all(
-      fechas.map((day) => procesarDia(day, false)) // false = dejar que auto-detecte
-    );
+    // ✅ concurrencia controlada (misma salida)
+    const daysConcurrency = Number(process.env.DAYS_CONCURRENCY || 4);
+    const dataPorDia = await mapLimit(fechas, daysConcurrency, async (day) => procesarDia(day, false));
 
     console.log(`[Rango] Completado: ${dataPorDia.length} días procesados`);
 
@@ -737,8 +769,7 @@ router.get("/rango", async (req, res) => {
       daily_data: dataPorDia,
     });
   } catch (err) {
-    const msg = err?.message || String(err);
-    return res.status(500).json({ error: msg });
+    return res.status(500).json({ error: err?.message || String(err) });
   }
 });
 
@@ -750,11 +781,9 @@ router.get("/usuario/:userId", async (req, res) => {
     const dateParam = String(req.query.date || "").trim();
     const day = dateParam || getTodayISOInTZ(TZ);
 
-    // ✅ Si el día pedido ES HOY, NO forzar búsqueda.
     const isCurrentDay = isToday(day, TZ);
     const useBusquedaLogic = !!dateParam && !isCurrentDay;
 
-    // hours solo aplica para pasado; para hoy lo ignoramos (da igual)
     const hours = String(req.query.hours || "work").trim();
 
     const detalle = await procesarDetalleUsuarioDia(userId, day, useBusquedaLogic, hours);
@@ -763,6 +792,5 @@ router.get("/usuario/:userId", async (req, res) => {
     return res.status(500).json({ error: err?.message || String(err) });
   }
 });
-
 
 module.exports = router;
