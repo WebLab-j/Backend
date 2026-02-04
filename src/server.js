@@ -1,48 +1,50 @@
+// file: src/server.js
+"use strict";
+
 require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
 const cron = require("node-cron");
-const { syncRange } = require("./services/syncService");
-
-const app = express();
-
-const allowedOrigins = [
-  "http://localhost:3000", // desarrollo
-  "https://analizador-front.vercel.app", // producción
-  "https://analizador-weblab.vercel.app"
-];
-
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true); // permitir Postman o server-to-server
-    if (allowedOrigins.indexOf(origin) === -1) {
-      return callback(new Error("CORS not allowed"), false);
-    }
-    return callback(null, true);
-  },
-  methods: ["GET", "POST", "PUT", "DELETE"],
-  credentials: true
-}));
-
-app.use(express.json());
 const axios = require("axios");
+
+const { syncRange } = require("./services/syncService");
 const { filterActividadesByWindow } = require("./utils/timeWindow");
 
+const app = express();
+app.use(express.json());
 
+/**
+ * CORS
+ * - En prod, usa CORS_ORIGINS="https://a.com,https://b.com"
+ * - En dev, fallback a lista hardcodeada.
+ */
+const defaultAllowedOrigins = [
+  "http://localhost:3000",
+  "https://analizador-front.vercel.app",
+  "https://analizador-weblab.vercel.app",
+];
 
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true); // permitir Postman o server-to-server
-    if (allowedOrigins.indexOf(origin) === -1) {
-      return callback(new Error("CORS not allowed"), false);
-    }
-    return callback(null, true);
-  },
-  methods: ["GET", "POST", "PUT", "DELETE"],
-  credentials: true
-}));
+const allowedOrigins = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
+const finalAllowedOrigins = allowedOrigins.length ? allowedOrigins : defaultAllowedOrigins;
 
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin) return callback(null, true);
+      if (!finalAllowedOrigins.includes(origin)) {
+        return callback(new Error("CORS not allowed"), false);
+      }
+      return callback(null, true);
+    },
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    credentials: true,
+  }),
+);
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
@@ -53,10 +55,10 @@ app.post("/sync", async (req, res) => {
       return res.status(400).json({ error: "Faltan query params start y end (YYYY-MM-DD)" });
     }
     const result = await syncRange(start, end);
-    res.json({ success: true, result });
+    return res.json({ success: true, result });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -65,27 +67,29 @@ app.get("/debug/actividades-9-5", async (req, res) => {
     const { date } = req.query;
     if (!date) return res.status(400).json({ success: false, error: "Falta ?date=YYYY-MM-DD" });
 
-    // 1) traer actividades del día
     const { data: actividadesRaw } = await axios.get(process.env.WL_ACTIVIDADES_URL, {
       params: { start: date, end: date },
     });
 
     const actividadesAll = Array.isArray(actividadesRaw?.data) ? actividadesRaw.data : [];
+    const { kept, minutosPlaneadosEnVentana } = filterActividadesByWindow(
+      actividadesAll,
+      date,
+      9,
+      17,
+      ["00Sec", "ftf"],
+    );
 
-    // 2) filtrar 9-5 (y opcional excluir tipos)
-    const { kept, minutosPlaneadosEnVentana } =
-      filterActividadesByWindow(actividadesAll, date, 9, 17, ["00Sec", "ftf"]);
-
-    res.json({
+    return res.json({
       success: true,
       date,
       window: "09:00-17:00",
       total: kept.length,
       minutosPlaneadosEnVentana,
-      actividades: kept, // ✅ ACTIVIDADES COMPLETAS
+      actividades: kept,
     });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    return res.status(500).json({ success: false, error: e.message });
   }
 });
 
@@ -104,17 +108,12 @@ app.get("/debug/revisiones-por-actividad-rango", async (req, res) => {
       params: { start, end },
     });
 
-    // --- normalizador robusto ---
     function normalizeRevisionesRobusto(raw) {
       if (!raw) return [];
-
-      // Caso A: ya viene arreglo plano
       if (Array.isArray(raw)) return raw;
       if (Array.isArray(raw?.data)) return raw.data;
 
       const out = [];
-
-      // Caso B: REPORTE agrupado (tu log: data.colaboradores[].items.actividades[])
       const data = raw?.data;
       const colaboradores = Array.isArray(data?.colaboradores) ? data.colaboradores : [];
 
@@ -159,9 +158,6 @@ app.get("/debug/revisiones-por-actividad-rango", async (req, res) => {
         }
       }
 
-      // Caso C: si además viene formato "revision con actividades:[{id}]"
-      // (lo detectamos si data es array o si data.items existe, etc.)
-      // Si tu API lo manda como raw.data.items o raw.data.revisiones, aquí lo puedes adaptar.
       const possibleList =
         (Array.isArray(raw?.data?.revisiones) && raw.data.revisiones) ||
         (Array.isArray(raw?.data?.items) && raw.data.items) ||
@@ -169,7 +165,9 @@ app.get("/debug/revisiones-por-actividad-rango", async (req, res) => {
 
       if (possibleList) {
         for (const r of possibleList) {
-          const actIds = Array.isArray(r?.actividades) ? r.actividades.map(a => a?.id).filter(Boolean) : [];
+          const actIds = Array.isArray(r?.actividades)
+            ? r.actividades.map((a) => a?.id).filter(Boolean)
+            : [];
           for (const actId of actIds) {
             out.push({
               revision_id: r?.id ?? null,
@@ -190,10 +188,9 @@ app.get("/debug/revisiones-por-actividad-rango", async (req, res) => {
     }
 
     const revisionesAll = normalizeRevisionesRobusto(revisionesRaw);
+    const revisiones = revisionesAll.filter((r) => r?.actividad_id === actividadId);
 
-    const revisiones = revisionesAll.filter(r => r?.actividad_id === actividadId);
-
-    res.json({
+    return res.json({
       success: true,
       start,
       end,
@@ -203,30 +200,37 @@ app.get("/debug/revisiones-por-actividad-rango", async (req, res) => {
       debug: { revisionesAll: revisionesAll.length },
     });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    return res.status(500).json({ success: false, error: e.message });
   }
 });
 
+/**
+ * Cron diario
+ */
+cron.schedule(
+  "0 8 * * *",
+  async () => {
+    try {
+      const now = new Date();
+      const y = new Date(now);
+      y.setDate(now.getDate() - 1);
+      const ymd = y.toISOString().slice(0, 10);
 
+      await syncRange(ymd, ymd);
+      console.log("Cron sync ok:", ymd);
+    } catch (e) {
+      console.error("Cron sync failed:", e.message);
+    }
+  },
+  { timezone: process.env.TZ || "America/Mexico_City" },
+);
 
-// opcional: cron diario para guardar "ayer" completo
-cron.schedule("0 8 * * *", async () => {
-  try {
-    const now = new Date();
-    const y = new Date(now);
-    y.setDate(now.getDate() - 1);
-    const ymd = y.toISOString().slice(0, 10);
-
-    await syncRange(ymd, ymd);
-    console.log("Cron sync ok:", ymd);
-  } catch (e) {
-    console.error("Cron sync failed:", e.message);
-  }
-}, { timezone: process.env.TZ || "America/Mexico_City" });
-
-const port = Number(process.env.PORT || 3001);
+// Routes
 const productividadHoyRoutes = require("../api/productividad.hoy.routes");
-
 app.use("/api/productividad", productividadHoyRoutes);
 
-app.listen(port, () => console.log(`API running on http://localhost:${port}`));
+// Render: escucha en 0.0.0.0 y process.env.PORT
+const port = Number(process.env.PORT || 3001);
+app.listen(port, "0.0.0.0", () => {
+  console.log(`API running on port ${port}`);
+});
