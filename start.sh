@@ -1,6 +1,6 @@
 # ---------- file: start.sh ----------
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
 
 # Levanta ML (interno)
 python3 -m uvicorn api.ml.main:app --host 0.0.0.0 --port 8000 &
