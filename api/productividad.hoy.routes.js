@@ -6,8 +6,7 @@ const axios = require("axios");
 const router = express.Router();
 
 const DEFAULT_ACT_URL = "https://wlserver-production-6735.up.railway.app/api/actividades";
-const DEFAULT_REV_URL =
-  "https://wlserver-production-6735.up.railway.app/api/reportes/revisiones-por-fecha";
+const DEFAULT_REV_URL ="https://wlserver-production-6735.up.railway.app/api/reportes/revisiones-por-fecha";
 
 const TZ = "America/Mexico_City";
 const START_HOUR = 9;
@@ -16,8 +15,7 @@ const START_MIN = START_HOUR * 60;
 const END_MIN = END_HOUR * 60;
 
 const USERS_SEARCH_URL =
-  process.env.WL_USERS_SEARCH_URL ||
-  "https://wlserver-production-6735.up.railway.app/api/users/search";
+  process.env.WL_USERS_SEARCH_URL ||"https://wlserver-production-6735.up.railway.app/api/users/search";
 
 const ALLOW_DOMAINS = new Set(["pprin.com", "practicante.com"]);
 
@@ -37,6 +35,22 @@ const ACT_CACHE_TTL_MS = 5 * 60 * 1000;
 // cache localParts: key -> {date,hour,minute}
 const localPartsCache = new Map();
 const LOCAL_PARTS_CACHE_MAX = 50_000;
+
+const SWITCH_CUTOFF_HOUR = Number(process.env.SWITCH_CUTOFF_HOUR || 10);
+
+function parseMode(raw) {
+  const v = String(raw || "").trim().toLowerCase();
+  if (v === "agenda" || v === "hecho") return v;
+  return "auto";
+}
+
+function getDefaultModeForDay(day) {
+  if (!isToday(day, TZ)) return "hecho";
+  const nowLocal = getLocalParts(new Date(), TZ);
+  const hour = nowLocal?.hour ?? 0;
+  return hour < SWITCH_CUTOFF_HOUR ? "agenda" : "hecho";
+}
+
 
 function pruneMapToMaxSize(map, max) {
   if (map.size <= max) return;
@@ -164,7 +178,7 @@ function esFtf00secPorTitulo(titulo) {
 // ---- user fetching ----
 
 async function fetchUserByIdViaSearch(userId) {
-  if (!userId) return { email: "", name: "" };
+  if (!userId) return { email: "", name: "", phone: "" };
 
   const hit = userCache.get(userId);
   const now = Date.now();
@@ -178,14 +192,15 @@ async function fetchUserByIdViaSearch(userId) {
       items.find((x) => x?._id === userId || x?.id === userId) || items[0] || null;
 
     const email = u?.email || "";
+    const phone = u?.phone || "";
     const name =
       [u?.firstName, u?.lastName].filter(Boolean).join(" ").trim() || u?.name || "";
 
-    const norm = { email, name, ts: now };
+    const norm = { email, name, phone, ts: now };
     userCache.set(userId, norm);
     return norm;
   } catch {
-    const norm = { email: "", name: "", ts: now };
+    const norm = { email: "", name: "", phone: "", ts: now };
     userCache.set(userId, norm);
     return norm;
   }
@@ -547,7 +562,6 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
   const isCurrentDay = isToday(day, TZ);
   const useFechaCreacion = useBusquedaLogic || !isCurrentDay;
 
-  // ✅ paralelo
   const [actividadesById, colaboradores, info] = await Promise.all([
     fetchActividades(day),
     fetchColaboradores(day),
@@ -557,7 +571,7 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
   if (ALL_EXCLUDED_IDS.has(userId)) {
     return {
       date: day,
-      user: { user_id: userId, colaborador: "", email: info.email || "" },
+      user: { user_id: userId, colaborador: "", email: info.email || "", phone: info.phone || "" },
       actividades: [],
       resumen: {
         actividades: 0,
@@ -574,7 +588,7 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
   if (!allowedByEmail(info.email || "")) {
     return {
       date: day,
-      user: { user_id: userId, colaborador: "", email: info.email || "" },
+      user: { user_id: userId, colaborador: "", email: info.email || "", phone: info.phone || "" },
       actividades: [],
       resumen: {
         actividades: 0,
@@ -593,7 +607,12 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
   if (!col) {
     return {
       date: day,
-      user: { user_id: userId, colaborador: info.name || userId, email: info.email || "" },
+      user: {
+        user_id: userId,
+        colaborador: info.name || userId,
+        email: info.email || "",
+        phone: info.phone || "",
+      },
       actividades: [],
       resumen: {
         actividades: 0,
@@ -627,7 +646,6 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
     }
   }
 
-  // Se mantiene (aunque no se use) para no alterar estructura/intención
   const passRevisionFilterPasado = (rev) => {
     const fc = rev?.fechaCreacion ?? rev?.createdAt ?? null;
     if (!fc) return false;
@@ -707,7 +725,7 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
 
   return {
     date: day,
-    user: { user_id: userId, colaborador: userName, email: info.email || "" },
+    user: { user_id: userId, colaborador: userName, email: info.email || "", phone: info.phone || "" },
     resumen: {
       actividades: features.actividades,
       revisiones: revisionesCount,
@@ -720,6 +738,7 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
     meta: { useFechaCreacion, isCurrentDay, hours },
   };
 }
+
 
 // ✅ RUTA 1
 router.get("/hoy", async (req, res) => {
@@ -781,16 +800,25 @@ router.get("/usuario/:userId", async (req, res) => {
     const dateParam = String(req.query.date || "").trim();
     const day = dateParam || getTodayISOInTZ(TZ);
 
-    const isCurrentDay = isToday(day, TZ);
-    const useBusquedaLogic = !!dateParam && !isCurrentDay;
-
     const hours = String(req.query.hours || "work").trim();
 
+    // mode=agenda|hecho|auto
+    const mode = parseMode(req.query.mode);
+    const resolvedMode = mode === "auto" ? getDefaultModeForDay(day) : mode;
+
+    // ✅ clave: permite "hecho" incluso si es HOY
+    const useBusquedaLogic = resolvedMode === "hecho";
+
     const detalle = await procesarDetalleUsuarioDia(userId, day, useBusquedaLogic, hours);
-    return res.json(detalle);
+
+    return res.json({
+      ...detalle,
+      meta: { ...detalle.meta, mode: resolvedMode, cutoffHour: SWITCH_CUTOFF_HOUR },
+    });
   } catch (err) {
     return res.status(500).json({ error: err?.message || String(err) });
   }
 });
+
 
 module.exports = router;
