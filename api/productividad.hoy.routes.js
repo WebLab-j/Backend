@@ -1,18 +1,17 @@
 // /routes/productividad.js
-"use strict";
-
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
-const http = require("http");
-const https = require("https");
+const { consumeStaleForDay } = require("../src/realtime/staleStore");
+const { peekStaleForDay, clearStaleUser, clearStaleDay } = require("../src/realtime/staleStore");
+const { setDayRaw, getDayRaw } = require("../src/realtime/rawStore");
+
 
 const router = express.Router();
 
-const DEFAULT_ACT_URL =
-  "https://wlserver-production-6735.up.railway.app/api/actividades";
-const DEFAULT_REV_URL =
-  "https://wlserver-production-6735.up.railway.app/api/reportes/revisiones-por-fecha";
+
+const DEFAULT_ACT_URL = "https://wlserver-production-6735.up.railway.app/api/actividades";
+const DEFAULT_REV_URL ="https://wlserver-production-6735.up.railway.app/api/reportes/revisiones-por-fecha";
 
 const TZ = "America/Mexico_City";
 const START_HOUR = 9;
@@ -21,86 +20,84 @@ const START_MIN = START_HOUR * 60;
 const END_MIN = END_HOUR * 60;
 
 const USERS_SEARCH_URL =
-  process.env.WL_USERS_SEARCH_URL ||
-  "https://wlserver-production-6735.up.railway.app/api/users/search";
+  process.env.WL_USERS_SEARCH_URL ||"https://wlserver-production-6735.up.railway.app/api/users/search";
 
 const ALLOW_DOMAINS = new Set(["pprin.com", "practicante.com"]);
 
-const DEBUG = String(process.env.DEBUG_PRODUCTIVIDAD || "").trim() === "1";
-function log(...args) {
-  if (DEBUG) console.log(...args);
-}
-
-// ---- axios (keep-alive + timeout + retry) ----
-
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
-
-const axiosClient = axios.create({
-  timeout: Number(process.env.HTTP_TIMEOUT_MS || 12_000),
-  httpAgent,
-  httpsAgent,
-  maxRedirects: 3,
-  validateStatus: (s) => s >= 200 && s < 300,
-});
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function isRetryableAxiosError(err) {
-  const code = err?.code || "";
-  const status = err?.response?.status;
-
-  if (status && [408, 425, 429, 500, 502, 503, 504].includes(status)) return true;
-  if (["ECONNRESET", "ETIMEDOUT", "EAI_AGAIN", "ENOTFOUND", "ECONNABORTED"].includes(code))
-    return true;
-
-  return false;
-}
-
-async function requestWithRetry(fn, { retries = 2, baseDelayMs = 250 } = {}) {
-  let attempt = 0;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    try {
-      return await fn();
-    } catch (err) {
-      attempt += 1;
-      if (attempt > retries || !isRetryableAxiosError(err)) throw err;
-      const delay = baseDelayMs * Math.pow(2, attempt - 1);
-      await sleep(delay);
-    }
-  }
-}
-
 // ---- caches ----
 
-// userId -> { email, name, phone, ts }
+// cache en memoria: userId -> { email, name, ts }
 const userCache = new Map();
 const USER_TTL_MS = 24 * 60 * 60 * 1000;
 
-// userId -> name
+// cache nombre en memoria: userId -> name
 const userNameCache = new Map();
 
-// actividadesCache: day -> { byId: Map, ts }
-const actividadesCache = new Map();
+// cache actividades por día con TTL
+const actividadesCache = new Map(); // day -> { byId: Map, ts }
 const ACT_CACHE_TTL_MS = 5 * 60 * 1000;
 
-// in-flight dedupe: key -> Promise
-const inFlight = new Map();
+// cache colaboradores/revisiones por día con TTL
+const colaboradoresCache = new Map(); // day -> { colaboradores: any[], ts }
+const COLAB_CACHE_TTL_MS = Number(process.env.COLAB_CACHE_TTL_MS || 60_000);
 
-// localPartsCache: tz|minuteBucket -> {date,hour,minute}
+
+// cache localParts: key -> {date,hour,minute}
 const localPartsCache = new Map();
-const LOCAL_PARTS_CACHE_MAX = 20_000;
+const LOCAL_PARTS_CACHE_MAX = 50_000;
 
 const SWITCH_CUTOFF_HOUR = Number(process.env.SWITCH_CUTOFF_HOUR || 10);
+
+// cache del resultado final /hoy por día
+const resultadoDiaCache = new Map(); // day -> { users: any[], ts: number, useFechaCreacion: boolean }
+const RESULT_CACHE_TTL_MS = Number(process.env.RESULT_CACHE_TTL_MS || 300000); // 30s
+
+// cache del detalle /usuario/:id por día+userId
+const detalleUsuarioCache = new Map(); // key -> { data: any, ts: number }
+const DETALLE_CACHE_TTL_MS = Number(process.env.DETALLE_CACHE_TTL_MS || 60_000); // 60s
+
+
+function isFresh(ts, ttl) {
+  return Date.now() - ts < ttl;
+}
+
+async function getOrFetchRawDay(day, fetchActividades, fetchColaboradores) {
+  const raw = getDayRaw(day);
+  if (raw?.colaboradoresRaw && raw?.actividadesById) return raw;
+
+  const [actividadesById, colaboradoresRaw] = await Promise.all([
+    fetchActividades(day),
+    fetchColaboradores(day),
+  ]);
+
+  setDayRaw(day, { colaboradoresRaw, actividadesById });
+  return getDayRaw(day);
+}
+
+function detalleKey(day, userId, useBusquedaLogic, hours, mode) {
+  return `${day}|${userId}|${useBusquedaLogic ? "hecho" : "agenda"}|${hours}|${mode}`;
+}
+
+function invalidateDayCaches(day, { actividades = true, colaboradores = true } = {}) {
+  if (!day) return;
+  if (actividades) actividadesCache.delete(day);
+  if (colaboradores) colaboradoresCache.delete(day);
+}
+
 
 function parseMode(raw) {
   const v = String(raw || "").trim().toLowerCase();
   if (v === "agenda" || v === "hecho") return v;
   return "auto";
 }
+
+function getDefaultModeForDay(day) {
+  if (!isToday(day, TZ)) return "hecho";
+  const nowLocal = getLocalParts(new Date(), TZ);
+  const hour = nowLocal?.hour ?? 0;
+  return hour < SWITCH_CUTOFF_HOUR ? "agenda" : "hecho";
+}
+
 
 function pruneMapToMaxSize(map, max) {
   if (map.size <= max) return;
@@ -167,9 +164,8 @@ function getTodayISOInTZ(timeZone) {
 function getLocalParts(dateObj, timeZone) {
   if (!(dateObj instanceof Date) || Number.isNaN(dateObj.getTime())) return null;
 
-  // cache por minuto (reduce cardinalidad x60)
-  const minuteBucket = Math.floor(dateObj.getTime() / 60_000);
-  const key = `${timeZone}|${minuteBucket}`;
+  const ms = dateObj.getTime();
+  const key = `${timeZone}|${ms}`;
 
   const cached = localPartsCache.get(key);
   if (cached) return cached;
@@ -185,6 +181,7 @@ function getLocalParts(dateObj, timeZone) {
     else if (p.type === "hour") h = p.value;
     else if (p.type === "minute") min = p.value;
   }
+
   if (!y || !m || !d || h == null || min == null) return null;
 
   const value = { date: `${y}-${m}-${d}`, hour: Number(h), minute: Number(min) };
@@ -209,36 +206,20 @@ function isBetweenWorkHoursLocal(dateStr, day, timeZone, noDateReason) {
   return { ok: true, reason: "ok" };
 }
 
+// ---- FILTRO 1: dueStart ----
 function isDueStartBetween9and5Local(dueStartStr, day, timeZone) {
   return isBetweenWorkHoursLocal(dueStartStr, day, timeZone, "no_dueStart");
 }
 
+// ---- FILTRO 2: fechaCreacion ----
 function isFechaCreacionBetween9and5Local(fechaCreacionStr, day, timeZone) {
-  return isBetweenWorkHoursLocal(
-    fechaCreacionStr,
-    day,
-    timeZone,
-    "no_fechaCreacion"
-  );
+  return isBetweenWorkHoursLocal(fechaCreacionStr, day, timeZone, "no_fechaCreacion");
 }
 
 // regex precompilado
 const ftfRegex = /ftf|00sec/i;
 function esFtf00secPorTitulo(titulo) {
   return ftfRegex.test(String(titulo ?? ""));
-}
-
-// ---- today check ----
-
-function isToday(dateStr, timeZone) {
-  return dateStr === getTodayISOInTZ(timeZone);
-}
-
-function getDefaultModeForDay(day) {
-  if (!isToday(day, TZ)) return "hecho";
-  const nowLocal = getLocalParts(new Date(), TZ);
-  const hour = nowLocal?.hour ?? 0;
-  return hour < SWITCH_CUTOFF_HOUR ? "agenda" : "hecho";
 }
 
 // ---- user fetching ----
@@ -251,22 +232,16 @@ async function fetchUserByIdViaSearch(userId) {
   if (hit && now - hit.ts < USER_TTL_MS) return hit;
 
   try {
-    const { data } = await requestWithRetry(() =>
-      axiosClient.get(USERS_SEARCH_URL, { params: { q: userId } })
-    );
+    const { data } = await axios.get(USERS_SEARCH_URL, { params: { q: userId } });
 
     const items = Array.isArray(data?.items) ? data.items : [];
     const u =
-      items.find((x) => x?._id === userId || x?.id === userId) ||
-      items[0] ||
-      null;
+      items.find((x) => x?._id === userId || x?.id === userId) || items[0] || null;
 
     const email = u?.email || "";
     const phone = u?.phone || "";
     const name =
-      [u?.firstName, u?.lastName].filter(Boolean).join(" ").trim() ||
-      u?.name ||
-      "";
+      [u?.firstName, u?.lastName].filter(Boolean).join(" ").trim() || u?.name || "";
 
     const norm = { email, name, phone, ts: now };
     userCache.set(userId, norm);
@@ -292,10 +267,7 @@ async function resolveUsersMap(userIds, concurrency = 4) {
     }
   }
 
-  const workers = Array.from(
-    { length: Math.min(concurrency, ids.length) },
-    () => worker()
-  );
+  const workers = Array.from({ length: Math.min(concurrency, ids.length) }, () => worker());
   await Promise.all(workers);
   return out;
 }
@@ -331,102 +303,44 @@ function resolveUserName(col) {
   return fallback;
 }
 
-// ---- data fetching (with in-flight dedupe) ----
-
-async function deduped(key, fn) {
-  const hit = inFlight.get(key);
-  if (hit) return hit;
-
-  const p = (async () => {
-    try {
-      return await fn();
-    } finally {
-      inFlight.delete(key);
-    }
-  })();
-
-  inFlight.set(key, p);
-  return p;
-}
+// ---- data fetching ----
 
 async function fetchActividades(day) {
   const cached = actividadesCache.get(day);
   const now = Date.now();
   if (cached && now - cached.ts < ACT_CACHE_TTL_MS) return cached.byId;
 
-  return deduped(`act:${day}`, async () => {
-    const again = actividadesCache.get(day);
-    const againNow = Date.now();
-    if (again && againNow - again.ts < ACT_CACHE_TTL_MS) return again.byId;
+  const actUrl = process.env.WL_ACTIVIDADES_URL || DEFAULT_ACT_URL;
+  const { data } = await axios.get(actUrl, { params: { start: day, end: day } });
 
-    const actUrl = process.env.WL_ACTIVIDADES_URL || DEFAULT_ACT_URL;
+  const list = Array.isArray(data?.data) ? data.data : [];
+  const byId = new Map();
 
-    const { data } = await requestWithRetry(() =>
-      axiosClient.get(actUrl, { params: { start: day, end: day } })
-    );
+  for (const a of list) {
+    if (!a?.id) continue;
+    byId.set(a.id, {
+      id: a.id,
+      dueStart: a.dueStart ?? null,
+      titulo: a.titulo ?? "",
+    });
+  }
 
-    const list = Array.isArray(data?.data) ? data.data : [];
-    const byId = new Map();
-
-    for (const a of list) {
-      if (!a?.id) continue;
-      byId.set(a.id, {
-        id: a.id,
-        dueStart: a.dueStart ?? null,
-        titulo: a.titulo ?? "",
-      });
-    }
-
-    actividadesCache.set(day, { byId, ts: Date.now() });
-    return byId;
-  });
+  actividadesCache.set(day, { byId, ts: now });
+  return byId;
 }
 
 async function fetchColaboradores(day) {
-  return deduped(`col:${day}`, async () => {
-    const revUrl = process.env.WL_REVISIONES_POR_FECHA_URL || DEFAULT_REV_URL;
-
-    const { data } = await requestWithRetry(() =>
-      axiosClient.get(revUrl, { params: { date: day } })
-    );
-
-    return Array.isArray(data?.data?.colaboradores) ? data.data.colaboradores : [];
-  });
+  const revUrl = process.env.WL_REVISIONES_POR_FECHA_URL || DEFAULT_REV_URL;
+  const { data } = await axios.get(revUrl, { params: { date: day } });
+  return Array.isArray(data?.data?.colaboradores) ? data.data.colaboradores : [];
 }
 
-// ---- exclude filters ----
-
-const EXCLUDE_USER_IDS = new Set(["2dad872b594c81c8ae6500026864f907"]);
-const EXCLUDE_USER_IDS2 = new Set(["2e6d872b594c8100ac680002df5d84c5"]);
-const EXCLUDE_USER_IDS3 = new Set(["2edd872b594c818984190002be5174f1"]);
-const ALL_EXCLUDED_IDS = new Set([
-  ...EXCLUDE_USER_IDS,
-  ...EXCLUDE_USER_IDS2,
-  ...EXCLUDE_USER_IDS3,
-]);
-
-// ---- concurrency helper (no deps) ----
-
-async function mapLimit(items, limit, mapper) {
-  const out = new Array(items.length);
-  let idx = 0;
-
-  async function worker() {
-    while (idx < items.length) {
-      const current = idx++;
-      out[current] = await mapper(items[current], current);
-    }
-  }
-
-  const workers = Array.from({ length: Math.min(limit, items.length) }, () =>
-    worker()
-  );
-  await Promise.all(workers);
-  return out;
+// ✅ DETERMINAR SI ES HOY O UNA BÚSQUEDA ESPECÍFICA
+function isToday(dateStr, timeZone) {
+  return dateStr === getTodayISOInTZ(timeZone);
 }
 
-// ---- HOY (1 pasada) ----
-
+// ---- HOY (misma lógica, optimizada: 1 pasada) ----
 function procesarColaboradorDia_HOY(col, day, actividadesById) {
   const userId = col?.idAsignee;
   if (!userId) return null;
@@ -461,6 +375,7 @@ function procesarColaboradorDia_HOY(col, day, actividadesById) {
       for (const r of revs) {
         const dur = Number(r?.duracionMin ?? 0) || 0;
         revisiones += 1;
+
         if (dur > 0) {
           revisiones_con_duracion += 1;
           minutos += dur;
@@ -483,8 +398,27 @@ function procesarColaboradorDia_HOY(col, day, actividadesById) {
   };
 }
 
-// ---- BÚSQUEDA ----
+async function recomputarFilaUsuario(day, useFechaCreacion, userId, actividadesById, colaboradoresRaw) {
+  const col = Array.isArray(colaboradoresRaw)
+    ? colaboradoresRaw.find((c) => c?.idAsignee === userId) || null
+    : null;
 
+  if (!col) return null;
+
+  const base = useFechaCreacion
+    ? procesarColaboradorDia_BUSQUEDA(col, day, actividadesById)
+    : procesarColaboradorDia_HOY(col, day, actividadesById);
+
+  if (!base) return null;
+
+  return {
+    ...base,
+    prediccion: await predecirConModelo(base),
+  };
+}
+
+
+// ---- BÚSQUEDA (misma lógica) ----
 function procesarColaboradorDia_BUSQUEDA(col, day, actividadesById) {
   const userId = col?.idAsignee;
   if (!userId) return null;
@@ -515,6 +449,7 @@ function procesarColaboradorDia_BUSQUEDA(col, day, actividadesById) {
 
     for (const r of terminadas) {
       revisiones += 1;
+
       const dur = Number(r?.duracionMin ?? 0) || 0;
       if (dur > 0) {
         revisiones_con_duracion += 1;
@@ -540,19 +475,121 @@ function procesarColaboradorDia_BUSQUEDA(col, day, actividadesById) {
 async function predecirConModelo(features) {
   const mlBase = process.env.ML_API_BASE || "http://127.0.0.1:8000";
   const url = `${mlBase}/predict`;
-
-  const { data } = await requestWithRetry(
-    () =>
-      axiosClient.post(url, {
-        actividades: features.actividades,
-        revisiones_con_duracion: features.revisiones_con_duracion,
-        revisiones_sin_duracion: features.revisiones_sin_duracion,
-        tiempo_total: features.tiempo_total,
-      }),
-    { retries: 1 }
-  );
-
+  const { data } = await axios.post(url, {
+    actividades: features.actividades,
+    revisiones_con_duracion: features.revisiones_con_duracion,
+    revisiones_sin_duracion: features.revisiones_sin_duracion,
+    tiempo_total: features.tiempo_total,
+  });
   return data;
+}
+
+// ---- FILTRO DE USUARIOS (exclusión) ----
+const EXCLUDE_DOMAINS = new Set(["officlean.com", "aluvri.com"]); // (se mantiene aunque no se use)
+const EXCLUDE_USER_IDS = new Set(["2dad872b594c81c8ae6500026864f907"]);
+const EXCLUDE_USER_IDS2 = new Set(["2e6d872b594c8100ac680002df5d84c5"]);
+const EXCLUDE_USER_IDS3 = new Set(["2edd872b594c818984190002be5174f1"]);
+
+// Unificado (más rápido, misma lógica)
+const ALL_EXCLUDED_IDS = new Set([...EXCLUDE_USER_IDS, ...EXCLUDE_USER_IDS2, ...EXCLUDE_USER_IDS3]);
+
+// ---- Concurrency helper (sin deps) ----
+async function mapLimit(items, limit, mapper) {
+  const out = new Array(items.length);
+  let idx = 0;
+
+  async function worker() {
+    while (idx < items.length) {
+      const current = idx++;
+      out[current] = await mapper(items[current], current);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+  await Promise.all(workers);
+  return out;
+}
+
+// ✅ FUNCIÓN AUXILIAR: Procesar un día
+async function procesarDia(day, useBusquedaLogic = false) {
+  try {
+    const isCurrentDay = isToday(day, TZ);
+    const useFechaCreacion = useBusquedaLogic || !isCurrentDay;
+
+    console.log(
+      `[procesarDia] ${day} - isCurrentDay: ${isCurrentDay} - useFechaCreacion: ${useFechaCreacion}`
+    );
+
+    // ✅ paralelo (misma data)
+    const [actividadesById, colaboradoresRaw] = await Promise.all([
+      fetchActividades(day),
+      fetchColaboradores(day),
+    ]);
+    setDayRaw(day, { colaboradoresRaw, actividadesById });
+
+    console.log("[RAW STORE] setDayRaw", {
+  day,
+  colaboradores: Array.isArray(colaboradoresRaw) ? colaboradoresRaw.length : 0,
+  actividades: actividadesById instanceof Map ? actividadesById.size : 0,
+});
+
+
+    let colaboradores = colaboradoresRaw;
+    
+
+    // Resolver emails por userId
+    const userIds = colaboradores.map((c) => c?.idAsignee).filter(Boolean);
+    const usersInfo = await resolveUsersMap(userIds, Number(process.env.USERS_CONCURRENCY || 4));
+
+    // Filtrar dominios + IDs (misma lógica)
+    colaboradores = colaboradores.filter((col) => {
+      const userId = col?.idAsignee;
+      if (!userId) return false;
+
+      if (ALL_EXCLUDED_IDS.has(userId)) {
+        console.log(`[FILTRO] Excluyendo usuario por ID: ${userId}`);
+        return false;
+      }
+
+      const info = usersInfo.get(userId) || {};
+      const email = info.email || "";
+
+      if (!allowedByEmail(email)) {
+        console.log(`[FILTRO] Excluyendo por dominio. userId=${userId} email=${email}`);
+        return false;
+      }
+
+      return true;
+    });
+
+    let rows;
+    if (useFechaCreacion) {
+      console.log(`[procesarDia] Usando lógica BÚSQUEDA (fechaCreacion)`);
+      rows = colaboradores
+        .map((c) => procesarColaboradorDia_BUSQUEDA(c, day, actividadesById))
+        .filter(Boolean);
+    } else {
+      console.log(`[procesarDia] Usando lógica HOY (dueStart)`);
+      rows = colaboradores
+        .map((c) => procesarColaboradorDia_HOY(c, day, actividadesById))
+        .filter(Boolean);
+    }
+
+    // ✅ Limitar concurrencia ML (misma salida, menos saturación)
+    const mlConcurrency = Number(process.env.ML_CONCURRENCY || 6);
+    const users = await mapLimit(rows, mlConcurrency, async (r) => ({
+      ...r,
+      prediccion: await predecirConModelo(r),
+    }));
+
+    users.sort((a, b) => (b.tiempo_total || 0) - (a.tiempo_total || 0));
+
+    return { date: day, users };
+  } catch (err) {
+    console.error(`[procesarDia] Error en ${day}:`, err?.message || err);
+    return { date: day, users: [], error: err?.message || String(err) };
+  }
+  
 }
 
 function safeArray(v) {
@@ -598,75 +635,7 @@ function summarizeActividadBuckets(actividad) {
   return out;
 }
 
-// ✅ Procesar un día
-async function procesarDia(day, useBusquedaLogic = false) {
-  try {
-    const isCurrentDay = isToday(day, TZ);
-    const useFechaCreacion = useBusquedaLogic || !isCurrentDay;
-
-    log(
-      `[procesarDia] ${day} - isCurrentDay: ${isCurrentDay} - useFechaCreacion: ${useFechaCreacion}`
-    );
-
-    const [actividadesById, colaboradoresRaw] = await Promise.all([
-      fetchActividades(day),
-      fetchColaboradores(day),
-    ]);
-
-    const userIds = colaboradoresRaw.map((c) => c?.idAsignee).filter(Boolean);
-    const usersInfo = await resolveUsersMap(
-      userIds,
-      Number(process.env.USERS_CONCURRENCY || 4)
-    );
-
-    const colaboradores = colaboradoresRaw.filter((col) => {
-      const userId = col?.idAsignee;
-      if (!userId) return false;
-
-      if (ALL_EXCLUDED_IDS.has(userId)) {
-        log(`[FILTRO] Excluyendo usuario por ID: ${userId}`);
-        return false;
-      }
-
-      const info = usersInfo.get(userId) || {};
-      const email = info.email || "";
-
-      if (!allowedByEmail(email)) {
-        log(`[FILTRO] Excluyendo por dominio. userId=${userId} email=${email}`);
-        return false;
-      }
-
-      return true;
-    });
-
-    const rows = useFechaCreacion
-      ? colaboradores
-          .map((c) => procesarColaboradorDia_BUSQUEDA(c, day, actividadesById))
-          .filter(Boolean)
-      : colaboradores
-          .map((c) => procesarColaboradorDia_HOY(c, day, actividadesById))
-          .filter(Boolean);
-
-    const mlConcurrency = Number(process.env.ML_CONCURRENCY || 6);
-    const users = await mapLimit(rows, mlConcurrency, async (r) => ({
-      ...r,
-      prediccion: await predecirConModelo(r),
-    }));
-
-    users.sort((a, b) => (b.tiempo_total || 0) - (a.tiempo_total || 0));
-    return { date: day, users };
-  } catch (err) {
-    console.error(`[procesarDia] Error en ${day}:`, err?.message || err);
-    return { date: day, users: [], error: err?.message || String(err) };
-  }
-}
-
-async function procesarDetalleUsuarioDia(
-  userId,
-  day,
-  useBusquedaLogic = false,
-  hours = "all"
-) {
+async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, hours = "all") {
   const isCurrentDay = isToday(day, TZ);
   const useFechaCreacion = useBusquedaLogic || !isCurrentDay;
 
@@ -679,12 +648,7 @@ async function procesarDetalleUsuarioDia(
   if (ALL_EXCLUDED_IDS.has(userId)) {
     return {
       date: day,
-      user: {
-        user_id: userId,
-        colaborador: "",
-        email: info.email || "",
-        phone: info.phone || "",
-      },
+      user: { user_id: userId, colaborador: "", email: info.email || "", phone: info.phone || "" },
       actividades: [],
       resumen: {
         actividades: 0,
@@ -701,12 +665,7 @@ async function procesarDetalleUsuarioDia(
   if (!allowedByEmail(info.email || "")) {
     return {
       date: day,
-      user: {
-        user_id: userId,
-        colaborador: "",
-        email: info.email || "",
-        phone: info.phone || "",
-      },
+      user: { user_id: userId, colaborador: "", email: info.email || "", phone: info.phone || "" },
       actividades: [],
       resumen: {
         actividades: 0,
@@ -764,6 +723,18 @@ async function procesarDetalleUsuarioDia(
     }
   }
 
+  const passRevisionFilterPasado = (rev) => {
+    const fc = rev?.fechaCreacion ?? rev?.createdAt ?? null;
+    if (!fc) return false;
+
+    const local = getLocalParts(new Date(fc), TZ);
+    if (!local || local.date !== day) return false;
+
+    if (hours === "work") return isFechaCreacionBetween9and5Local(fc, day, TZ).ok;
+    return true;
+  };
+  void passRevisionFilterPasado;
+
   const actividadesDetalle = [];
 
   for (const a of acts) {
@@ -782,15 +753,7 @@ async function procesarDetalleUsuarioDia(
       const terminadas = safeArray(a?.terminadas);
       for (const r of terminadas) {
         const norm = normalizeRevision(r);
-        if (!norm) continue;
-
-        if (hours === "work") {
-          const fc = norm?.fechaCreacion;
-          if (!fc) continue;
-          if (!isFechaCreacionBetween9and5Local(fc, day, TZ).ok) continue;
-        }
-
-        revisiones.terminadas.push(norm);
+        if (norm) revisiones.terminadas.push(norm);
       }
     } else {
       for (const b of buckets) {
@@ -803,9 +766,7 @@ async function procesarDetalleUsuarioDia(
     }
 
     const total =
-      revisiones.terminadas.length +
-      revisiones.confirmadas.length +
-      revisiones.pendientes.length;
+      revisiones.terminadas.length + revisiones.confirmadas.length + revisiones.pendientes.length;
 
     if (total === 0) continue;
 
@@ -841,12 +802,7 @@ async function procesarDetalleUsuarioDia(
 
   return {
     date: day,
-    user: {
-      user_id: userId,
-      colaborador: userName,
-      email: info.email || "",
-      phone: info.phone || "",
-    },
+    user: { user_id: userId, colaborador: userName, email: info.email || "", phone: info.phone || "" },
     resumen: {
       actividades: features.actividades,
       revisiones: revisionesCount,
@@ -860,21 +816,116 @@ async function procesarDetalleUsuarioDia(
   };
 }
 
-// ---- routes ----
 
-// ✅ RUTA 1
+// /routes/productividad.js
+// ... tus requires arriba
+
+
+
+function modeKeyFor(useFechaCreacion) {
+  return useFechaCreacion ? "hecho" : "agenda";
+}
+
+function dayCacheKey(day, useFechaCreacion) {
+  return `${day}|${modeKeyFor(useFechaCreacion)}`;
+}
+
+function deleteResultadoDiaCacheForDay(day) {
+  resultadoDiaCache.delete(`${day}|agenda`);
+  resultadoDiaCache.delete(`${day}|hecho`);
+}
+
+// ✅ RUTA 1 (con cache + stale por usuario) — ACTUALIZADA
 router.get("/hoy", async (req, res) => {
   try {
     const dateParam = String(req.query.date || "").trim();
     const day = dateParam || getTodayISOInTZ(TZ);
     const useBusquedaLogic = !!dateParam;
 
+    const isCurrentDay = isToday(day, TZ);
+    const useFechaCreacion = useBusquedaLogic || !isCurrentDay;
+
+    const cacheKey = dayCacheKey(day, useFechaCreacion);
+    const cached = resultadoDiaCache.get(cacheKey);
+
+    // 1) cache fresco del mismo modo -> intenta partial rebuild
+    if (
+      cached &&
+      isFresh(cached.ts, RESULT_CACHE_TTL_MS) &&
+      cached.useFechaCreacion === useFechaCreacion
+    ) {
+      const stale = peekStaleForDay(day);
+
+      // stale global/día -> fuerza recompute total
+      if (stale.all || stale.dayStale) {
+        deleteResultadoDiaCacheForDay(day);
+        clearStaleDay(day);
+      } else if (stale.users.size > 0) {
+        // ✅ AQUÍ ESTÁ EL CAMBIO CLAVE: usa RAW (no WL)
+        const raw = await getOrFetchRawDay(day, fetchActividades, fetchColaboradores);
+        const actividadesById = raw.actividadesById;
+        const colaboradoresRaw = raw.colaboradoresRaw;
+
+        const byUserId = new Map(cached.users.map((u) => [u.user_id, u]));
+
+        for (const uid of stale.users) {
+          const updated = await recomputarFilaUsuario(
+            day,
+            useFechaCreacion,
+            uid,
+            actividadesById,
+            colaboradoresRaw
+          );
+
+          if (!updated) byUserId.delete(uid);
+          else byUserId.set(uid, updated);
+
+          clearStaleUser(day, uid);
+        }
+
+        const users = Array.from(byUserId.values());
+        users.sort((a, b) => (b.tiempo_total || 0) - (a.tiempo_total || 0));
+
+        // ✅ cachea el resultado parcial (last-known-good)
+        resultadoDiaCache.set(cacheKey, {
+          users,
+          ts: Date.now(),
+          useFechaCreacion,
+        });
+
+        return res.json({ date: day, users, meta: { fromCache: true, partial: true } });
+      } else {
+        // cache hit limpio
+        return res.json({ date: day, users: cached.users, meta: { fromCache: true } });
+      }
+    }
+
+    // 2) sin cache / vencido -> recompute total (aquí sí puedes usar procesarDia)
     const resultado = await procesarDia(day, useBusquedaLogic);
-    return res.json({ date: resultado.date, users: resultado.users });
+
+    // ✅ si WL falló, no envenenes cache
+    if (resultado?.error) {
+      const prev = resultadoDiaCache.get(cacheKey);
+      if (prev && prev.users?.length) {
+        return res.json({ date: day, users: prev.users, meta: { fromCache: true, degraded: true } });
+      }
+      return res.status(502).json({ error: "Upstream WL failed", detail: resultado.error });
+    }
+
+    resultadoDiaCache.set(cacheKey, {
+      users: resultado.users,
+      ts: Date.now(),
+      useFechaCreacion,
+    });
+
+    clearStaleDay(day);
+    return res.json({ date: resultado.date, users: resultado.users, meta: { fromCache: false } });
   } catch (err) {
     return res.status(500).json({ error: err?.message || String(err) });
   }
 });
+
+
 
 // ✅ RUTA 2
 router.get("/rango", async (req, res) => {
@@ -883,29 +934,24 @@ router.get("/rango", async (req, res) => {
     const end = String(req.query.end || "").trim();
 
     if (!start || !end) {
-      return res
-        .status(400)
-        .json({ error: "start y end son requeridos (YYYY-MM-DD)" });
+      return res.status(400).json({ error: "start y end son requeridos (YYYY-MM-DD)" });
     }
 
-    // iterar días evitando DST usando UTC-millis
     const fechas = [];
-    const startMs = Date.parse(`${start}T00:00:00.000Z`);
-    const endMs = Date.parse(`${end}T00:00:00.000Z`);
-    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs > endMs) {
-      return res.status(400).json({ error: "rango inválido" });
+    const inicioDate = new Date(start);
+    const finDate = new Date(end);
+
+    for (let d = new Date(inicioDate); d <= finDate; d.setDate(d.getDate() + 1)) {
+      fechas.push(d.toISOString().slice(0, 10));
     }
 
-    for (let ms = startMs; ms <= endMs; ms += 24 * 60 * 60 * 1000) {
-      fechas.push(new Date(ms).toISOString().slice(0, 10));
-    }
+    console.log(`[Rango] Procesando ${fechas.length} días desde ${start} hasta ${end}`);
 
-    log(`[Rango] Procesando ${fechas.length} días desde ${start} hasta ${end}`);
-
+    // ✅ concurrencia controlada (misma salida)
     const daysConcurrency = Number(process.env.DAYS_CONCURRENCY || 4);
-    const dataPorDia = await mapLimit(fechas, daysConcurrency, async (day) =>
-      procesarDia(day, false)
-    );
+    const dataPorDia = await mapLimit(fechas, daysConcurrency, async (day) => procesarDia(day, false));
+
+    console.log(`[Rango] Completado: ${dataPorDia.length} días procesados`);
 
     return res.json({
       start,
@@ -933,15 +979,10 @@ router.get("/usuario/:userId", async (req, res) => {
     const mode = parseMode(req.query.mode);
     const resolvedMode = mode === "auto" ? getDefaultModeForDay(day) : mode;
 
-    // permite "hecho" incluso si es HOY
+    // ✅ clave: permite "hecho" incluso si es HOY
     const useBusquedaLogic = resolvedMode === "hecho";
 
-    const detalle = await procesarDetalleUsuarioDia(
-      userId,
-      day,
-      useBusquedaLogic,
-      hours
-    );
+    const detalle = await procesarDetalleUsuarioDia(userId, day, useBusquedaLogic, hours);
 
     return res.json({
       ...detalle,
@@ -951,5 +992,8 @@ router.get("/usuario/:userId", async (req, res) => {
     return res.status(500).json({ error: err?.message || String(err) });
   }
 });
+
+
+
 
 module.exports = router;

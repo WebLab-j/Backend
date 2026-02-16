@@ -10,9 +10,73 @@ const axios = require("axios");
 
 const { syncRange } = require("./services/syncService");
 const { filterActividadesByWindow } = require("./utils/timeWindow");
+const { startWlSocketListener } = require("./realtime/wlSocketListener");
+const { applyRevisionEvent } = require("./realtime/rawStore");
+
+
+const {
+  markStaleAll,
+  markStaleDay,
+  markStaleUser,
+} = require("./realtime/staleStore");
 
 const app = express();
 app.use(express.json());
+
+const TZ = process.env.TZ || "America/Mexico_City";
+
+function toDayISOInTZ(dateStr, timeZone = TZ) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr);
+  if (Number.isNaN(d.getTime())) return null;
+
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
+}
+
+function todayISOInTZ(timeZone = TZ) {
+  return toDayISOInTZ(new Date(), timeZone);
+}
+
+
+/**
+ * Helpers: ids y días afectados por evento (agenda + hecho)
+ */
+function extractUserIds(payload) {
+  const ids = Array.isArray(payload?.assignees)
+    ? payload.assignees.map((a) => a?.id).filter(Boolean)
+    : [];
+  return Array.from(new Set(ids));
+}
+
+
+/**
+ * Devuelve TODOS los días que podrían verse afectados por el evento:
+ * - agenda: dueStart
+ * - hecho: fechaFinTerminada / fechaCreacion / fechaCreacionImportante (fallback)
+ */
+function extractAffectedDays(payload) {
+  const days = new Set();
+
+  const dueDay = toDayISOInTZ(payload?.dueStart);
+  if (dueDay) days.add(dueDay);
+
+  const finDay = toDayISOInTZ(payload?.fechaFinTerminada);
+  if (finDay) days.add(finDay);
+
+  const creDay = toDayISOInTZ(payload?.fechaCreacion);
+  if (creDay) days.add(creDay);
+
+  const impDay = toDayISOInTZ(payload?.fechaCreacionImportante);
+  if (impDay) days.add(impDay);
+
+  return Array.from(days);
+}
+
 
 /**
  * CORS
@@ -214,8 +278,7 @@ cron.schedule(
       const now = new Date();
       const y = new Date(now);
       y.setDate(now.getDate() - 1);
-      const ymd = y.toISOString().slice(0, 10);
-
+      const ymd = toDayISOInTZ(y, TZ);
       await syncRange(ymd, ymd);
       console.log("Cron sync ok:", ymd);
     } catch (e) {
@@ -228,6 +291,78 @@ cron.schedule(
 // Routes
 const productividadHoyRoutes = require("../api/productividad.hoy.routes");
 app.use("/api/productividad", productividadHoyRoutes);
+
+/**
+ * Socket listener
+ * ENV: WL_SOCKET_URL=https://wlserver-production-6735.up.railway.app
+ */
+try {
+  const socketUrl = process.env.WL_SOCKET_URL;
+  if (socketUrl) {
+    startWlSocketListener({
+      socketUrl,
+      handleEvent: (eventName, payload, meta) => {
+        const id = payload?.id ?? payload?._id ?? null;
+
+        const actividadId = Array.isArray(payload?.actividadesRelacionadas)
+          ? payload.actividadesRelacionadas[0]
+          : null;
+
+        const userIds = extractUserIds(payload);
+        const days = extractAffectedDays(payload);
+
+      // --- marcar stale (V2: multi-day) ---
+if (days.length === 0 && userIds.length === 0) {
+  // no tenemos pistas: global
+  markStaleAll();
+
+} else if (days.length === 0 && userIds.length > 0) {
+  // no sabemos día, pero sí usuario: NO tires todo
+  // marca "hoy" (útil para tu dashboard)
+  const today = todayISOInTZ();
+  for (const uid of userIds) markStaleUser(today, uid);
+
+} else if (userIds.length === 0) {
+  // sabemos día, no sabemos usuario
+  for (const day of days) markStaleDay(day);
+
+} else {
+  // sabemos día y usuarios
+  for (const day of days) for (const uid of userIds) markStaleUser(day, uid);
+}
+
+// ✅ 1) Si es evento de revisión, aplica patch al raw
+  if (eventName === "revision_creada" || eventName === "revision_actualizada") {
+    for (const day of days) {
+      const r = applyRevisionEvent(day, payload);
+      console.log("[RAW PATCH]", { day, eventName, touched: r.touchedUserIds, actividadId: r.actividadId });
+    }
+  }
+
+
+
+        console.log("[STALE MARK]", {
+          eventName,
+          id,
+          days,
+          userIds,
+          actividadId,
+          ts: meta.ts,
+          dates: {
+            dueStart: payload?.dueStart ?? null,
+            fechaFinTerminada: payload?.fechaFinTerminada ?? null,
+            fechaCreacion: payload?.fechaCreacion ?? null,
+            fechaCreacionImportante: payload?.fechaCreacionImportante ?? null,
+          },
+        });
+      },
+    });
+  } else {
+    console.warn("[wlSocketListener] WL_SOCKET_URL not set, skipping socket listener");
+  }
+} catch (e) {
+  console.error("[wlSocketListener] failed to start:", e?.message || e);
+}
 
 // Render: escucha en 0.0.0.0 y process.env.PORT
 const port = Number(process.env.PORT || 3001);
