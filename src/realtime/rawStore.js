@@ -8,6 +8,25 @@
  */
 const rawByDay = new Map();
 
+function listDays() {
+  return Array.from(rawByDay.keys());
+}
+
+function findDaysContainingActividad(actividadId) {
+  if (!actividadId) return [];
+  const out = [];
+  for (const [day, state] of rawByDay.entries()) {
+    const byId = state?.actividadesById;
+    if (byId instanceof Map && byId.has(actividadId)) out.push(day);
+  }
+  return out;
+}
+
+
+function hasDayRaw(day) {
+  return rawByDay.has(day);
+}
+
 function setDayRaw(day, { colaboradoresRaw, actividadesById }) {
   if (!day) return;
   rawByDay.set(day, {
@@ -33,6 +52,14 @@ function extractUserIds(payload) {
     : [];
   return Array.from(new Set(ids));
 }
+function findDaysWithActividad(actividadId) {
+  if (!actividadId) return [];
+  const days = [];
+  for (const [day, state] of rawByDay.entries()) {
+    if (state?.actividadesById?.has?.(actividadId)) days.push(day);
+  }
+  return days;
+}
 
 /**
  * Heurística bucket:
@@ -42,6 +69,10 @@ function extractUserIds(payload) {
  */
 function resolveBucketFromPayload(payload) {
   if (payload?.confirmacion === true) return "confirmadas";
+
+  // ✅ ESTA ES LA CLAVE PARA TU "HECHO"
+  if (payload?.terminadaPendienteRevision === true) return "terminadas";
+
   if (payload?.fechaFinTerminada) return "terminadas";
   return "pendientes";
 }
@@ -169,4 +200,7 @@ module.exports = {
   getDayRaw,
   applyRevisionEvent,
   applyRevisionDeletedEvent,
+  listDays,
+  findDaysContainingActividad,
+  findDaysWithActividad,
 };

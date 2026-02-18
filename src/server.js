@@ -11,7 +11,12 @@ const axios = require("axios");
 const { syncRange } = require("./services/syncService");
 const { filterActividadesByWindow } = require("./utils/timeWindow");
 const { startWlSocketListener } = require("./realtime/wlSocketListener");
-const { applyRevisionEvent } = require("./realtime/rawStore");
+const { applyRevisionEvent, applyRevisionDeletedEvent, findDaysWithActividad, getDayRaw } = require("./realtime/rawStore");
+const { upsertFromEvent, resolve } = require("./realtime/revisionIndex");
+const http = require("http");
+const { initUiSocket, emitDayUpdate, emitBroadcast } = require("./realtime/uiSocket");
+const { recomputarFilaUsuario } = require("../api/productividad.hoy.routes");
+
 
 
 const {
@@ -19,6 +24,7 @@ const {
   markStaleDay,
   markStaleUser,
 } = require("./realtime/staleStore");
+
 
 const app = express();
 app.use(express.json());
@@ -301,53 +307,116 @@ try {
   if (socketUrl) {
     startWlSocketListener({
       socketUrl,
-      handleEvent: (eventName, payload, meta) => {
-        const id = payload?.id ?? payload?._id ?? null;
+      handleEvent: async (eventName, payload, meta) => {
+        const revisionId = payload?.id ?? payload?._id ?? null;
 
         const actividadId = Array.isArray(payload?.actividadesRelacionadas)
           ? payload.actividadesRelacionadas[0]
           : null;
 
-        const userIds = extractUserIds(payload);
-        const days = extractAffectedDays(payload);
+        const today = todayISOInTZ();
 
-      // --- marcar stale (V2: multi-day) ---
-if (days.length === 0 && userIds.length === 0) {
-  // no tenemos pistas: global
-  markStaleAll();
+        let userIds = extractUserIds(payload);
+        let days = extractAffectedDays(payload);
 
-} else if (days.length === 0 && userIds.length > 0) {
-  // no sabemos día, pero sí usuario: NO tires todo
-  // marca "hoy" (útil para tu dashboard)
-  const today = todayISOInTZ();
-  for (const uid of userIds) markStaleUser(today, uid);
+        
+        // 2) Si viene incompleto (muy común en creada/eliminada), intenta resolver con el índice
+        if ((days.length === 0 || userIds.length === 0) && revisionId) {
+          const fromIdx = resolve(revisionId);
+          if (fromIdx) {
+            if (days.length === 0) days = Array.isArray(fromIdx.days) ? fromIdx.days : [];
+            if (userIds.length === 0) userIds = Array.isArray(fromIdx.userIds) ? fromIdx.userIds : [];
+          }
+        }
 
-} else if (userIds.length === 0) {
-  // sabemos día, no sabemos usuario
-  for (const day of days) markStaleDay(day);
+        // 3) Stale SIN tirar todo el sistema
+        if (days.length === 0 && userIds.length === 0) {
+          // antes: markStaleAll()  ❌  => esto te obliga a recompute full (WL)
+          markStaleDay(today); // ✅ degradado pero seguro
+        } else if (days.length === 0 && userIds.length > 0) {
+          for (const uid of userIds) markStaleUser(today, uid);
+        } else if (userIds.length === 0) {
+          for (const d of days) markStaleDay(d);
+        } else {
+          for (const d of days) for (const uid of userIds) markStaleUser(d, uid);
+        }
 
-} else {
-  // sabemos día y usuarios
-  for (const day of days) for (const uid of userIds) markStaleUser(day, uid);
+        // 4) Patch RAW (si days viene vacío, parchea hoy al menos)
+        // 4) Patch RAW: además de "days" por fechas, parchea también los días que YA tienen esa actividad en el raw cache
+const patchDaysSet = new Set(days);
+
+// Si la actividad existe en raw cache de otros días, esos días también deben parchearse
+if (actividadId) {
+  const daysByActividad = findDaysWithActividad(actividadId); // <-- ya lo importas arriba
+  for (const d of daysByActividad) patchDaysSet.add(d);
 }
 
-// ✅ 1) Si es evento de revisión, aplica patch al raw
-  if (eventName === "revision_creada" || eventName === "revision_actualizada") {
-    for (const day of days) {
-      const r = applyRevisionEvent(day, payload);
-      console.log("[RAW PATCH]", { day, eventName, touched: r.touchedUserIds, actividadId: r.actividadId });
+// fallback seguro
+if (patchDaysSet.size === 0) patchDaysSet.add(today);
+
+const daysForPatch = Array.from(patchDaysSet);
+
+if (eventName === "revision_creada" || eventName === "revision_actualizada") {
+  upsertFromEvent({ revisionId, days: daysForPatch, userIds, actividadId });
+}
+
+        for (const d of daysForPatch) {
+          let touchedUserIds = [];
+          let actividadIdFromPatch = actividadId;
+
+          if (eventName === "revision_creada" || eventName === "revision_actualizada") {
+            const r = applyRevisionEvent(d, payload);
+            touchedUserIds = Array.isArray(r?.touchedUserIds) ? r.touchedUserIds : [];
+            actividadIdFromPatch = r?.actividadId ?? actividadIdFromPatch;
+
+            console.log("[RAW PATCH]", { day: d, eventName, touched: touchedUserIds, actividadId: actividadIdFromPatch });
+          }
+
+          if (eventName === "revision_eliminada") {
+            const r = applyRevisionDeletedEvent(d, payload);
+            touchedUserIds = Array.isArray(r?.touchedUserIds) ? r.touchedUserIds : [];
+            console.log("[RAW PATCH]", { day: d, eventName, touched: touchedUserIds, revisionId: r?.revisionId ?? revisionId });
+          }
+         // ✅ Recomputa y emite con datos listos
+if (touchedUserIds.length > 0) {
+  const raw = getDayRaw(d);
+  const useFechaCreacion = d !== todayISOInTZ();
+  const updatedUsers = [];
+
+  if (raw?.actividadesById && raw?.colaboradoresRaw) {
+    for (const uid of touchedUserIds) {
+      try {
+        const fila = await recomputarFilaUsuario(
+          d, useFechaCreacion, uid,
+          raw.actividadesById,
+          raw.colaboradoresRaw,
+        );
+        if (fila) updatedUsers.push(fila);
+      } catch (e) {
+        console.error("[recompute]", uid, e?.message);
+      }
     }
   }
 
-
-
+  emitDayUpdate(d, {
+    kind: "users_changed",
+    day: d,
+    eventName,
+    userIds: touchedUserIds,
+    actividadId: actividadIdFromPatch,
+    revisionId,
+    ts: meta?.ts || new Date().toISOString(),
+    updatedUsers, // ✅ datos listos para el front
+  });
+}
+        }
         console.log("[STALE MARK]", {
           eventName,
-          id,
+          id: revisionId,
           days,
           userIds,
           actividadId,
-          ts: meta.ts,
+          ts: meta?.ts,
           dates: {
             dueStart: payload?.dueStart ?? null,
             fechaFinTerminada: payload?.fechaFinTerminada ?? null,
@@ -356,6 +425,7 @@ if (days.length === 0 && userIds.length === 0) {
           },
         });
       },
+
     });
   } else {
     console.warn("[wlSocketListener] WL_SOCKET_URL not set, skipping socket listener");
@@ -366,6 +436,11 @@ if (days.length === 0 && userIds.length === 0) {
 
 // Render: escucha en 0.0.0.0 y process.env.PORT
 const port = Number(process.env.PORT || 3001);
-app.listen(port, "0.0.0.0", () => {
+const httpServer = http.createServer(app);
+
+// CORS origins: reusa lo que ya tienes
+initUiSocket(httpServer, { corsOrigins: finalAllowedOrigins });
+
+httpServer.listen(port, "0.0.0.0", () => {
   console.log(`API running on port ${port}`);
 });

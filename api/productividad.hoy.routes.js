@@ -4,11 +4,12 @@ const express = require("express");
 const axios = require("axios");
 const { consumeStaleForDay } = require("../src/realtime/staleStore");
 const { peekStaleForDay, clearStaleUser, clearStaleDay } = require("../src/realtime/staleStore");
-const { setDayRaw, getDayRaw } = require("../src/realtime/rawStore");
+const { setDayRaw, getDayRaw, hasDayRaw, } = require("../src/realtime/rawStore");
 
 
 const router = express.Router();
 
+const seedInFlight = new Map();
 
 const DEFAULT_ACT_URL = "https://wlserver-production-6735.up.railway.app/api/actividades";
 const DEFAULT_REV_URL ="https://wlserver-production-6735.up.railway.app/api/reportes/revisiones-por-fecha";
@@ -23,6 +24,39 @@ const USERS_SEARCH_URL =
   process.env.WL_USERS_SEARCH_URL ||"https://wlserver-production-6735.up.railway.app/api/users/search";
 
 const ALLOW_DOMAINS = new Set(["pprin.com", "practicante.com"]);
+
+const seededDays = new Set(); // day -> ya se hizo 1 seed (vía WL) en este proceso
+
+async function buildUsersFromRaw({ day, useFechaCreacion, raw }) {
+  const actividadesById = raw.actividadesById;
+  let colaboradores = Array.isArray(raw.colaboradoresRaw) ? raw.colaboradoresRaw : [];
+
+  const userIds = colaboradores.map((c) => c?.idAsignee).filter(Boolean);
+  const usersInfo = await resolveUsersMap(userIds, Number(process.env.USERS_CONCURRENCY || 4));
+
+  colaboradores = colaboradores.filter((col) => {
+    const userId = col?.idAsignee;
+    if (!userId) return false;
+    if (ALL_EXCLUDED_IDS.has(userId)) return false;
+
+    const info = usersInfo.get(userId) || {};
+    const email = info.email || "";
+    return allowedByEmail(email);
+  });
+
+  const rows = useFechaCreacion
+    ? colaboradores.map((c) => procesarColaboradorDia_BUSQUEDA(c, day, actividadesById)).filter(Boolean)
+    : colaboradores.map((c) => procesarColaboradorDia_HOY(c, day, actividadesById)).filter(Boolean);
+
+  const mlConcurrency = Number(process.env.ML_CONCURRENCY || 6);
+  const users = await mapLimit(rows, mlConcurrency, async (r) => ({
+    ...r,
+    prediccion: await predecirConModelo(r),
+  }));
+
+  users.sort((a, b) => (b.tiempo_total || 0) - (a.tiempo_total || 0));
+  return users;
+}
 
 // ---- caches ----
 
@@ -848,24 +882,38 @@ router.get("/hoy", async (req, res) => {
     const cacheKey = dayCacheKey(day, useFechaCreacion);
     const cached = resultadoDiaCache.get(cacheKey);
 
-    // 1) cache fresco del mismo modo -> intenta partial rebuild
-    if (
-      cached &&
-      isFresh(cached.ts, RESULT_CACHE_TTL_MS) &&
-      cached.useFechaCreacion === useFechaCreacion
-    ) {
-      const stale = peekStaleForDay(day);
+    const stale = peekStaleForDay(day);
 
-      // stale global/día -> fuerza recompute total
+    // 0) Si ya hay cache, SIEMPRE intenta servirlo (aunque esté "viejo")
+    //    y aplicar partial/full desde RAW sin WL.
+    if (cached && cached.useFechaCreacion === useFechaCreacion) {
+      const raw = getDayRaw(day);
+
+      // Si no hay RAW, no podemos recomputar; devolvemos cache tal cual.
+      if (!raw?.colaboradoresRaw || !raw?.actividadesById) {
+        return res.json({
+          date: day,
+          users: cached.users,
+          meta: { fromCache: true, rawMissing: true, stale: { all: stale.all, dayStale: stale.dayStale, users: stale.users.size } },
+        });
+      }
+
+      // 0.a) Si el día entero está stale (o all), reconstruye FULL desde RAW (sin WL)
       if (stale.all || stale.dayStale) {
-        deleteResultadoDiaCacheForDay(day);
-        clearStaleDay(day);
-      } else if (stale.users.size > 0) {
-        // ✅ AQUÍ ESTÁ EL CAMBIO CLAVE: usa RAW (no WL)
-        const raw = await getOrFetchRawDay(day, fetchActividades, fetchColaboradores);
-        const actividadesById = raw.actividadesById;
-        const colaboradoresRaw = raw.colaboradoresRaw;
+        const users = await buildUsersFromRaw({ day, useFechaCreacion, raw });
 
+        resultadoDiaCache.set(cacheKey, {
+          users,
+          ts: Date.now(),
+          useFechaCreacion,
+        });
+
+        clearStaleDay(day);
+        return res.json({ date: day, users, meta: { fromCache: true, rebuilt: "full_from_raw" } });
+      }
+
+      // 0.b) Usuarios stale => partial rebuild desde RAW (sin WL)
+      if (stale.users.size > 0) {
         const byUserId = new Map(cached.users.map((u) => [u.user_id, u]));
 
         for (const uid of stale.users) {
@@ -873,8 +921,8 @@ router.get("/hoy", async (req, res) => {
             day,
             useFechaCreacion,
             uid,
-            actividadesById,
-            colaboradoresRaw
+            raw.actividadesById,
+            raw.colaboradoresRaw,
           );
 
           if (!updated) byUserId.delete(uid);
@@ -886,31 +934,68 @@ router.get("/hoy", async (req, res) => {
         const users = Array.from(byUserId.values());
         users.sort((a, b) => (b.tiempo_total || 0) - (a.tiempo_total || 0));
 
-        // ✅ cachea el resultado parcial (last-known-good)
         resultadoDiaCache.set(cacheKey, {
           users,
           ts: Date.now(),
           useFechaCreacion,
         });
 
-        return res.json({ date: day, users, meta: { fromCache: true, partial: true } });
-      } else {
-        // cache hit limpio
-        return res.json({ date: day, users: cached.users, meta: { fromCache: true } });
+        return res.json({ date: day, users, meta: { fromCache: true, rebuilt: "partial_from_raw" } });
       }
+
+      // 0.c) Cache limpio
+      return res.json({ date: day, users: cached.users, meta: { fromCache: true } });
     }
 
-    // 2) sin cache / vencido -> recompute total (aquí sí puedes usar procesarDia)
-    const resultado = await procesarDia(day, useBusquedaLogic);
+    // 1) No hay cache para ese modo.
+    //    Si YA existe RAW del día => construye FULL desde RAW (sin WL) y cachea.
+    const raw = getDayRaw(day);
+    if (raw?.colaboradoresRaw && raw?.actividadesById) {
+      const users = await buildUsersFromRaw({ day, useFechaCreacion, raw });
 
-    // ✅ si WL falló, no envenenes cache
-    if (resultado?.error) {
-      const prev = resultadoDiaCache.get(cacheKey);
-      if (prev && prev.users?.length) {
-        return res.json({ date: day, users: prev.users, meta: { fromCache: true, degraded: true } });
-      }
-      return res.status(502).json({ error: "Upstream WL failed", detail: resultado.error });
+      resultadoDiaCache.set(cacheKey, {
+        users,
+        ts: Date.now(),
+        useFechaCreacion,
+      });
+
+      // ojo: no limpies stale.users aquí; solo dayStale/all si lo necesitas
+      if (stale.dayStale || stale.all) clearStaleDay(day);
+
+      return res.json({ date: day, users, meta: { fromCache: true, built: "full_from_raw" } });
     }
+
+    // 2) No hay RAW: permitimos SOLO 1 seed WL por día (en este proceso)
+    // ✅ pon esto en su lugar
+// ✅ por esto
+if (seedInFlight.has(day)) {
+  await seedInFlight.get(day);
+  const raw = getDayRaw(day);
+  if (raw?.colaboradoresRaw && raw?.actividadesById) {
+    const users = await buildUsersFromRaw({ day, useFechaCreacion, raw });
+    return res.json({ date: day, users, meta: { fromCache: false, waited: true } });
+  }
+}
+
+let resolveSeed;
+const seedPromise = new Promise((r) => { resolveSeed = r; });
+seedInFlight.set(day, seedPromise);
+
+let resultado;
+try {
+  resultado = await procesarDia(day, useBusquedaLogic);
+} catch (err) {
+  seedInFlight.delete(day);
+  resolveSeed();
+  return res.status(500).json({ error: err?.message || String(err) });
+}
+
+seedInFlight.delete(day);
+resolveSeed();
+
+if (resultado?.error) {
+  return res.status(502).json({ error: "Upstream WL failed", detail: resultado.error });
+}
 
     resultadoDiaCache.set(cacheKey, {
       users: resultado.users,
@@ -919,7 +1004,7 @@ router.get("/hoy", async (req, res) => {
     });
 
     clearStaleDay(day);
-    return res.json({ date: resultado.date, users: resultado.users, meta: { fromCache: false } });
+    return res.json({ date: resultado.date, users: resultado.users, meta: { fromCache: false, seeded: true } });
   } catch (err) {
     return res.status(500).json({ error: err?.message || String(err) });
   }
@@ -947,7 +1032,7 @@ router.get("/rango", async (req, res) => {
 
     console.log(`[Rango] Procesando ${fechas.length} días desde ${start} hasta ${end}`);
 
-    // ✅ concurrencia controlada (misma salida)
+    // concurrencia controlada (misma salida)
     const daysConcurrency = Number(process.env.DAYS_CONCURRENCY || 4);
     const dataPorDia = await mapLimit(fechas, daysConcurrency, async (day) => procesarDia(day, false));
 
@@ -992,8 +1077,5 @@ router.get("/usuario/:userId", async (req, res) => {
     return res.status(500).json({ error: err?.message || String(err) });
   }
 });
-
-
-
 
 module.exports = router;
