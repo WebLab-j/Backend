@@ -16,6 +16,8 @@ const { upsertFromEvent, resolve } = require("./realtime/revisionIndex");
 const http = require("http");
 const { initUiSocket, emitDayUpdate, emitBroadcast } = require("./realtime/uiSocket");
 const { recomputarFilaUsuario, updateCachedUsers } = require("../api/productividad.hoy.routes");
+// ✅ busca en actividadesCache directamente (siempre disponible si hubo fetch)
+const { fetchActividades } = require("../api/productividad.hoy.routes");
 
 
 
@@ -407,16 +409,51 @@ if (updatedUsers.length > 0) {
   updateCachedUsers(today, false, updatedUsers); // modo agenda
 }
   console.log("[EMIT]", { today, updatedUsers: updatedUsers.length });
-  emitDayUpdate(today, { // ✅ siempre emite al día de hoy
-    kind: "users_changed",
-    day: today,
-    eventName,
-    userIds: touchedUserIds,
-    actividadId: actividadIdFromPatch,
-    revisionId,
-    ts: meta?.ts || new Date().toISOString(),
-    updatedUsers,
-  });
+  console.log("[PAYLOAD COMPLETO]", JSON.stringify(payload, null, 2));
+  console.log("[ACTIVIDAD BUSQUEDA]", {
+  actividadIdFromPatch,
+  tieneRaw: !!raw,
+  tieneActividadesById: !!raw?.actividadesById,
+  keys: Object.keys(raw?.actividadesById || {}).slice(0, 3),
+  encontrada: raw?.actividadesById?.[actividadIdFromPatch],
+});
+// ✅ busca el nombre de la actividad en el raw cache
+
+// ✅ busca título de actividad en colaboradoresRaw (siempre tiene datos)
+let actividadNombre = null;
+let actividadDueStart = null;
+
+if (actividadIdFromPatch && raw?.actividadesById instanceof Map) {
+  const act = raw.actividadesById.get(actividadIdFromPatch);
+  actividadNombre = act?.titulo ?? null;
+  actividadDueStart = act?.dueStart ?? null;
+}
+
+// fallback en colaboradoresRaw si el Map estaba vacío
+if (!actividadNombre && raw?.colaboradoresRaw) {
+  for (const col of raw.colaboradoresRaw) {
+    const acts = Array.isArray(col?.items?.actividades) ? col.items.actividades : [];
+    const act = acts.find((a) => a?.id === actividadIdFromPatch);
+    if (act?.titulo) { actividadNombre = act.titulo; break; }
+  }
+}
+
+emitDayUpdate(today, {
+  kind: "users_changed",
+  day: today,
+  eventName,
+  userIds: touchedUserIds,
+  actividadId: actividadIdFromPatch,
+  revisionId,
+  useFechaCreacion,
+  ts: meta?.ts || new Date().toISOString(),
+  updatedUsers,
+  revisionInfo: {
+    nombreRevision: payload?.nombre ?? null,
+    nombreActividad: actividadNombre,
+    horario: actividadDueStart, 
+  },
+});
 }
         
         console.log("[STALE MARK]", {
