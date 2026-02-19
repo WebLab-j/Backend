@@ -15,7 +15,7 @@ const { applyRevisionEvent, applyRevisionDeletedEvent, findDaysWithActividad, ge
 const { upsertFromEvent, resolve } = require("./realtime/revisionIndex");
 const http = require("http");
 const { initUiSocket, emitDayUpdate, emitBroadcast } = require("./realtime/uiSocket");
-const { recomputarFilaUsuario } = require("../api/productividad.hoy.routes");
+const { recomputarFilaUsuario, updateCachedUsers } = require("../api/productividad.hoy.routes");
 
 
 
@@ -353,41 +353,44 @@ if (actividadId) {
 
 // fallback seguro
 if (patchDaysSet.size === 0) patchDaysSet.add(today);
-
+patchDaysSet.add(today);
 const daysForPatch = Array.from(patchDaysSet);
 
 if (eventName === "revision_creada" || eventName === "revision_actualizada") {
-  upsertFromEvent({ revisionId, days: daysForPatch, userIds, actividadId });
+  upsertFromEvent({ revisionId, days: [today], userIds, actividadId });
 }
 
-        for (const d of daysForPatch) {
-          let touchedUserIds = [];
-          let actividadIdFromPatch = actividadId;
+// ✅ siempre parchea sobre el RAW de hoy
+let touchedUserIds = [];
+let actividadIdFromPatch = actividadId;
 
-          if (eventName === "revision_creada" || eventName === "revision_actualizada") {
-            const r = applyRevisionEvent(d, payload);
-            touchedUserIds = Array.isArray(r?.touchedUserIds) ? r.touchedUserIds : [];
-            actividadIdFromPatch = r?.actividadId ?? actividadIdFromPatch;
+if (eventName === "revision_creada" || eventName === "revision_actualizada") {
+  const r = applyRevisionEvent(today, payload);
+  touchedUserIds = Array.isArray(r?.touchedUserIds) ? r.touchedUserIds : [];
+  actividadIdFromPatch = r?.actividadId ?? actividadIdFromPatch;
+  console.log("[RAW PATCH]", { day: today, eventName, touched: touchedUserIds, actividadId: actividadIdFromPatch });
+}
 
-            console.log("[RAW PATCH]", { day: d, eventName, touched: touchedUserIds, actividadId: actividadIdFromPatch });
-          }
+if (eventName === "revision_eliminada") {
+  const r = applyRevisionDeletedEvent(today, payload);
+  touchedUserIds = Array.isArray(r?.touchedUserIds) ? r.touchedUserIds : [];
+  console.log("[RAW PATCH]", { day: today, eventName, touched: touchedUserIds, revisionId });
+}
 
-          if (eventName === "revision_eliminada") {
-            const r = applyRevisionDeletedEvent(d, payload);
-            touchedUserIds = Array.isArray(r?.touchedUserIds) ? r.touchedUserIds : [];
-            console.log("[RAW PATCH]", { day: d, eventName, touched: touchedUserIds, revisionId: r?.revisionId ?? revisionId });
-          }
-         // ✅ Recomputa y emite con datos listos
 if (touchedUserIds.length > 0) {
-  const raw = getDayRaw(d);
-  const useFechaCreacion = d !== todayISOInTZ();
+  const raw = getDayRaw(today);
   const updatedUsers = [];
+
+  // ✅ determina el modo según el payload
+  const useFechaCreacion = payload?.terminadaPendienteRevision === true
+    || payload?.confirmacion === true
+    || !!payload?.fechaFinTerminada;
 
   if (raw?.actividadesById && raw?.colaboradoresRaw) {
     for (const uid of touchedUserIds) {
       try {
         const fila = await recomputarFilaUsuario(
-          d, useFechaCreacion, uid,
+          today, useFechaCreacion, uid,
           raw.actividadesById,
           raw.colaboradoresRaw,
         );
@@ -397,19 +400,25 @@ if (touchedUserIds.length > 0) {
       }
     }
   }
-
-  emitDayUpdate(d, {
+  // después de calcular updatedUsers...
+// ✅ así debe quedar
+if (updatedUsers.length > 0) {
+  updateCachedUsers(today, true, updatedUsers);  // modo hecho
+  updateCachedUsers(today, false, updatedUsers); // modo agenda
+}
+  console.log("[EMIT]", { today, updatedUsers: updatedUsers.length });
+  emitDayUpdate(today, { // ✅ siempre emite al día de hoy
     kind: "users_changed",
-    day: d,
+    day: today,
     eventName,
     userIds: touchedUserIds,
     actividadId: actividadIdFromPatch,
     revisionId,
     ts: meta?.ts || new Date().toISOString(),
-    updatedUsers, // ✅ datos listos para el front
+    updatedUsers,
   });
 }
-        }
+        
         console.log("[STALE MARK]", {
           eventName,
           id: revisionId,

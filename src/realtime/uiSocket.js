@@ -14,6 +14,8 @@ function initUiSocket(httpServer, { corsOrigins = [] } = {}) {
   });
 
   io.on("connection", (socket) => {
+    socket.join("all_days"); // ← agrega esta línea
+
     // el front se suscribe a días específicos para no spamear
     socket.on("subscribe_day", ({ day }) => {
       if (day) socket.join(`day:${day}`);
@@ -40,6 +42,7 @@ function initUiSocket(httpServer, { corsOrigins = [] } = {}) {
 function emitDayUpdate(day, payload) {
   if (!ioRef || !day) return;
   ioRef.to(`day:${day}`).emit("day_update", payload);
+  ioRef.to("all_days").emit("day_update", payload); // ← todos los eventos
 }
 
 function emitUserNotification(userId, payload) {

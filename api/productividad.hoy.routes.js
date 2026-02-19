@@ -12,7 +12,7 @@ const router = express.Router();
 const seedInFlight = new Map();
 
 const DEFAULT_ACT_URL = "https://wlserver-production-6735.up.railway.app/api/actividades";
-const DEFAULT_REV_URL ="https://wlserver-production-6735.up.railway.app/api/reportes/revisiones-por-fecha";
+const DEFAULT_REV_URL = "https://wlserver-production-6735.up.railway.app/api/reportes/revisiones-por-fecha";
 
 const TZ = "America/Mexico_City";
 const START_HOUR = 9;
@@ -21,7 +21,7 @@ const START_MIN = START_HOUR * 60;
 const END_MIN = END_HOUR * 60;
 
 const USERS_SEARCH_URL =
-  process.env.WL_USERS_SEARCH_URL ||"https://wlserver-production-6735.up.railway.app/api/users/search";
+  process.env.WL_USERS_SEARCH_URL || "https://wlserver-production-6735.up.railway.app/api/users/search";
 
 const ALLOW_DOMAINS = new Set(["pprin.com", "practicante.com"]);
 
@@ -96,16 +96,40 @@ function isFresh(ts, ttl) {
 }
 
 async function getOrFetchRawDay(day, fetchActividades, fetchColaboradores) {
-  const raw = getDayRaw(day);
-  if (raw?.colaboradoresRaw && raw?.actividadesById) return raw;
+  // 1) No hay cache para ese modo.
+const raw = getDayRaw(day);
+if (raw?.colaboradoresRaw && raw?.actividadesById) {
+  
+  // ✅ Si piden modo hecho, siempre re-fetchea colaboradores desde WL
+  // porque el RAW puede tener datos de agenda sin revisiones terminadas
+  if (useFechaCreacion) {
+    // re-fetch colaboradores frescos para modo hecho
+    let resultado;
+    try {
+      resultado = await procesarDia(day, true); // true = useBusquedaLogic
+    } catch (err) {
+      return res.status(500).json({ error: err?.message || String(err) });
+    }
 
-  const [actividadesById, colaboradoresRaw] = await Promise.all([
-    fetchActividades(day),
-    fetchColaboradores(day),
-  ]);
+    if (resultado?.error) {
+      return res.status(502).json({ error: "Upstream WL failed", detail: resultado.error });
+    }
 
-  setDayRaw(day, { colaboradoresRaw, actividadesById });
-  return getDayRaw(day);
+    resultadoDiaCache.set(cacheKey, {
+      users: resultado.users,
+      ts: Date.now(),
+      useFechaCreacion,
+    });
+
+    return res.json({ date: resultado.date, users: resultado.users, meta: { fromCache: false, seeded: true, mode: "hecho" } });
+  }
+
+  // modo agenda: construye desde RAW existente
+  const users = await buildUsersFromRaw({ day, useFechaCreacion, raw });
+  resultadoDiaCache.set(cacheKey, { users, ts: Date.now(), useFechaCreacion });
+  if (stale.dayStale || stale.all) clearStaleDay(day);
+  return res.json({ date: day, users, meta: { fromCache: true, built: "full_from_raw" } });
+}
 }
 
 function detalleKey(day, userId, useBusquedaLogic, hours, mode) {
@@ -562,14 +586,14 @@ async function procesarDia(day, useBusquedaLogic = false) {
     setDayRaw(day, { colaboradoresRaw, actividadesById });
 
     console.log("[RAW STORE] setDayRaw", {
-  day,
-  colaboradores: Array.isArray(colaboradoresRaw) ? colaboradoresRaw.length : 0,
-  actividades: actividadesById instanceof Map ? actividadesById.size : 0,
-});
+      day,
+      colaboradores: Array.isArray(colaboradoresRaw) ? colaboradoresRaw.length : 0,
+      actividades: actividadesById instanceof Map ? actividadesById.size : 0,
+    });
 
 
     let colaboradores = colaboradoresRaw;
-    
+
 
     // Resolver emails por userId
     const userIds = colaboradores.map((c) => c?.idAsignee).filter(Boolean);
@@ -623,7 +647,7 @@ async function procesarDia(day, useBusquedaLogic = false) {
     console.error(`[procesarDia] Error en ${day}:`, err?.message || err);
     return { date: day, users: [], error: err?.message || String(err) };
   }
-  
+
 }
 
 function safeArray(v) {
@@ -967,41 +991,43 @@ router.get("/hoy", async (req, res) => {
 
     // 2) No hay RAW: permitimos SOLO 1 seed WL por día (en este proceso)
     // ✅ pon esto en su lugar
-// ✅ por esto
-if (seedInFlight.has(day)) {
-  await seedInFlight.get(day);
-  const raw = getDayRaw(day);
-  if (raw?.colaboradoresRaw && raw?.actividadesById) {
-    const users = await buildUsersFromRaw({ day, useFechaCreacion, raw });
-    return res.json({ date: day, users, meta: { fromCache: false, waited: true } });
-  }
-}
+    // ✅ por esto
+    if (seedInFlight.has(day)) {
+      await seedInFlight.get(day);
+      const raw = getDayRaw(day);
+      if (raw?.colaboradoresRaw && raw?.actividadesById) {
+        const users = await buildUsersFromRaw({ day, useFechaCreacion, raw });
+        return res.json({ date: day, users, meta: { fromCache: false, waited: true } });
+      }
+    }
 
-let resolveSeed;
-const seedPromise = new Promise((r) => { resolveSeed = r; });
-seedInFlight.set(day, seedPromise);
+    let resolveSeed;
+    const seedPromise = new Promise((r) => { resolveSeed = r; });
+    seedInFlight.set(day, seedPromise);
 
-let resultado;
-try {
-  resultado = await procesarDia(day, useBusquedaLogic);
-} catch (err) {
-  seedInFlight.delete(day);
-  resolveSeed();
-  return res.status(500).json({ error: err?.message || String(err) });
-}
+    let resultado;
+    try {
+      resultado = await procesarDia(day, useBusquedaLogic);
+    } catch (err) {
+      seedInFlight.delete(day);
+      resolveSeed();
+      return res.status(500).json({ error: err?.message || String(err) });
+    }
 
-seedInFlight.delete(day);
-resolveSeed();
+    seedInFlight.delete(day);
+    resolveSeed();
 
-if (resultado?.error) {
-  return res.status(502).json({ error: "Upstream WL failed", detail: resultado.error });
-}
+    if (resultado?.error) {
+      return res.status(502).json({ error: "Upstream WL failed", detail: resultado.error });
+    }
 
     resultadoDiaCache.set(cacheKey, {
       users: resultado.users,
       ts: Date.now(),
       useFechaCreacion,
     });
+
+
 
     clearStaleDay(day);
     return res.json({ date: resultado.date, users: resultado.users, meta: { fromCache: false, seeded: true } });
@@ -1078,4 +1104,99 @@ router.get("/usuario/:userId", async (req, res) => {
   }
 });
 
+// ✅ DEBUG: ver si existe cache por modo y cuántos users tiene
+router.get("/debug/cache", (req, res) => {
+  const day = String(req.query.day || "").trim() || getTodayISOInTZ(TZ);
+
+  const agendaKey = `${day}|agenda`;
+  const hechoKey = `${day}|hecho`;
+
+  const agenda = resultadoDiaCache.get(agendaKey);
+  const hecho = resultadoDiaCache.get(hechoKey);
+
+  const raw = getDayRaw(day);
+
+  return res.json({
+    day,
+    keys: {
+      agendaKey,
+      hechoKey,
+    },
+    cache: {
+      agenda: agenda
+        ? { exists: true, users: agenda.users?.length || 0, ts: agenda.ts, useFechaCreacion: agenda.useFechaCreacion }
+        : { exists: false },
+      hecho: hecho
+        ? { exists: true, users: hecho.users?.length || 0, ts: hecho.ts, useFechaCreacion: hecho.useFechaCreacion }
+        : { exists: false },
+    },
+    raw: {
+      exists: !!(raw?.colaboradoresRaw && raw?.actividadesById),
+      colaboradores: Array.isArray(raw?.colaboradoresRaw) ? raw.colaboradoresRaw.length : 0,
+      actividades: raw?.actividadesById instanceof Map ? raw.actividadesById.size : 0,
+    },
+  });
+});
+
+// ✅ DEBUG: ver contenido del cache por modo (top N + ids + resumen)
+router.get("/debug/cache/peek", (req, res) => {
+  const day = String(req.query.day || "").trim() || getTodayISOInTZ(TZ);
+  const mode = String(req.query.mode || "agenda").trim().toLowerCase();
+  const limit = Math.max(1, Math.min(200, Number(req.query.limit || 20)));
+
+  const key = `${day}|${mode === "hecho" ? "hecho" : "agenda"}`;
+  const cached = resultadoDiaCache.get(key);
+
+  if (!cached) {
+    return res.status(404).json({ day, mode, key, exists: false });
+  }
+
+  const users = Array.isArray(cached.users) ? cached.users : [];
+
+  // resumen rápido
+  const resumen = {
+    users: users.length,
+    total_minutos: users.reduce((acc, u) => acc + (Number(u?.tiempo_total) || 0), 0),
+    total_revisiones: users.reduce((acc, u) => acc + (Number(u?.revisiones) || 0), 0),
+    total_actividades: users.reduce((acc, u) => acc + (Number(u?.actividades) || 0), 0),
+  };
+
+  const top = users.slice(0, limit).map((u) => ({
+    user_id: u.user_id,
+    colaborador: u.colaborador,
+    actividades: u.actividades,
+    revisiones: u.revisiones,
+    tiempo_total: u.tiempo_total,
+  }));
+
+  return res.json({
+    day,
+    mode,
+    key,
+    ts: cached.ts,
+    useFechaCreacion: cached.useFechaCreacion,
+    resumen,
+    top,
+  });
+});
+
+
+// al final de productividad.js
+function updateCachedUsers(day, useFechaCreacion, updatedUsers) {
+  const cacheKey = dayCacheKey(day, useFechaCreacion);
+  const cached = resultadoDiaCache.get(cacheKey);
+  if (!cached) return;
+
+  const byId = new Map(cached.users.map((u) => [u.user_id, u]));
+  for (const u of updatedUsers) {
+    byId.set(u.user_id, { ...(byId.get(u.user_id) || {}), ...u });
+  }
+  const users = Array.from(byId.values())
+    .sort((a, b) => (b.tiempo_total || 0) - (a.tiempo_total || 0));
+
+  resultadoDiaCache.set(cacheKey, { ...cached, users, ts: Date.now() });
+}
+
 module.exports = router;
+module.exports.recomputarFilaUsuario = recomputarFilaUsuario;
+module.exports.updateCachedUsers = updateCachedUsers; // ✅
