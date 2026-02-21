@@ -11,8 +11,8 @@ const router = express.Router();
 
 const seedInFlight = new Map();
 
-const DEFAULT_ACT_URL = "https://wlserver-production-6735.up.railway.app/api/actividades";
-const DEFAULT_REV_URL = "https://wlserver-production-6735.up.railway.app/api/reportes/revisiones-por-fecha";
+const DEFAULT_ACT_URL = "https://wlserver-production.up.railway.app/api/actividades";
+const DEFAULT_REV_URL = "https://wlserver-production.up.railway.app/api/reportes/revisiones-por-fecha";
 
 const TZ = "America/Mexico_City";
 const START_HOUR = 9;
@@ -21,7 +21,7 @@ const START_MIN = START_HOUR * 60;
 const END_MIN = END_HOUR * 60;
 
 const USERS_SEARCH_URL =
-  process.env.WL_USERS_SEARCH_URL || "https://wlserver-production-6735.up.railway.app/api/users/search";
+  process.env.WL_USERS_SEARCH_URL || "https://wlserver-production.up.railway.app/api/users/search";
 
 const ALLOW_DOMAINS = new Set(["pprin.com", "practicante.com"]);
 
