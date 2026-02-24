@@ -25,6 +25,8 @@ const USERS_SEARCH_URL =
 
 const ALLOW_DOMAINS = new Set(["pprin.com", "practicante.com"]);
 
+const wlStats = { actividades: 0, colaboradores: 0 };
+
 const seededDays = new Set(); // day -> ya se hizo 1 seed (vía WL) en este proceso
 
 async function buildUsersFromRaw({ day, useFechaCreacion, raw }) {
@@ -367,6 +369,8 @@ async function fetchActividades(day) {
   const cached = actividadesCache.get(day);
   const now = Date.now();
   if (cached && now - cached.ts < ACT_CACHE_TTL_MS) return cached.byId;
+  wlStats.actividades += 1;
+console.log("[WL] fetchActividades", { day, count: wlStats.actividades });
 
   const actUrl = process.env.WL_ACTIVIDADES_URL || DEFAULT_ACT_URL;
   const { data } = await axios.get(actUrl, { params: { start: day, end: day } });
@@ -389,6 +393,7 @@ async function fetchActividades(day) {
 
 async function fetchColaboradores(day) {
   const revUrl = process.env.WL_REVISIONES_POR_FECHA_URL || DEFAULT_REV_URL;
+  
   const { data } = await axios.get(revUrl, { params: { date: day } });
   return Array.isArray(data?.data?.colaboradores) ? data.data.colaboradores : [];
 }
@@ -1116,7 +1121,45 @@ setInterval(pruneResultadoDiaCache, PRUNE_MS).unref?.();
 //  - Diario 09:00 CDMX
 //  - Al boot si falta cache (auto-recovery)
 // ===============================
+function detalleTtlForDay(dayIso) {
+  return isToday(dayIso, TZ) ? DETALLE_CACHE_TTL_MS : WEEK_CACHE_TTL_MS;
+}
 
+function detalleCacheGet(key, dayIso) {
+  const hit = detalleUsuarioCache.get(key);
+  if (!hit) return null;
+
+  const ttl = detalleTtlForDay(dayIso);
+  if (Date.now() - (hit.ts || 0) >= ttl) {
+    detalleUsuarioCache.delete(key);
+    return null;
+  }
+  return hit.data;
+}
+
+function detalleCacheSet(key, dayIso, data) {
+  detalleUsuarioCache.set(key, { data, ts: Date.now() });
+
+  // opcional: evita crecimiento infinito
+  const MAX_DETALLE = Number(process.env.MAX_DETALLE_CACHE || 50_000);
+  if (detalleUsuarioCache.size > MAX_DETALLE) {
+    // borra las primeras llaves (FIFO-ish)
+    const over = detalleUsuarioCache.size - MAX_DETALLE;
+    let i = 0;
+    for (const k of detalleUsuarioCache.keys()) {
+      detalleUsuarioCache.delete(k);
+      if (++i >= over) break;
+    }
+  }
+}
+
+// borrar todo el detalle de un user en un day (por stale)
+function deleteDetalleForDayUser(dayIso, userId) {
+  const prefix = `${dayIso}|${userId}|`;
+  for (const k of detalleUsuarioCache.keys()) {
+    if (String(k).startsWith(prefix)) detalleUsuarioCache.delete(k);
+  }
+}
 
 
 function addDaysISOInTZ(dayIso, timeZone, days) {
@@ -1458,15 +1501,37 @@ router.get("/usuario/:userId", async (req, res) => {
     const mode = parseMode(req.query.mode);
     const resolvedMode = mode === "auto" ? getDefaultModeForDay(day) : mode;
 
-    // ✅ clave: permite "hecho" incluso si es HOY
+    // hecho => useBusquedaLogic=true
     const useBusquedaLogic = resolvedMode === "hecho";
 
-    const detalle = await procesarDetalleUsuarioDia(userId, day, useBusquedaLogic, hours);
+    // ✅ key incluye todo lo que cambia el resultado
+    const key = detalleKey(day, userId, useBusquedaLogic, hours, resolvedMode);
 
-    return res.json({
+    // ✅ si el día está dentro de ventana (hoy o últimos N días), sirve cache
+    // (si no quieres cachear detalle fuera de ventana, lo respetamos)
+    if (canCache(day, TZ)) {
+      const cached = detalleCacheGet(key, day);
+      if (cached) {
+        return res.json({ ...cached, meta: { ...(cached.meta || {}), fromCache: true } });
+      }
+    } else {
+      // si está fuera de ventana, asegúrate de no conservarlo
+      detalleUsuarioCache.delete(key);
+    }
+
+    // ✅ calcula normal
+    const detalle = await procesarDetalleUsuarioDia(userId, day, useBusquedaLogic, hours);
+    const payload = {
       ...detalle,
-      meta: { ...detalle.meta, mode: resolvedMode, cutoffHour: SWITCH_CUTOFF_HOUR },
-    });
+      meta: { ...detalle.meta, mode: resolvedMode, cutoffHour: SWITCH_CUTOFF_HOUR, fromCache: false },
+    };
+
+    // ✅ guarda cache si aplica
+    if (canCache(day, TZ)) {
+      detalleCacheSet(key, day, payload);
+    }
+
+    return res.json(payload);
   } catch (err) {
     return res.status(500).json({ error: err?.message || String(err) });
   }
