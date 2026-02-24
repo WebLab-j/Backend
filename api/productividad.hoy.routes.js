@@ -892,6 +892,395 @@ function deleteResultadoDiaCacheForDay(day) {
   resultadoDiaCache.delete(`${day}|agenda`);
   resultadoDiaCache.delete(`${day}|hecho`);
 }
+// ===============================
+// ✅ Cache SOLO últimos 7 días (y HOY como ya está)
+// ===============================
+
+// deja tu Map tal cual
+// const resultadoDiaCache = new Map(); // day|mode -> { users, ts, useFechaCreacion }
+const LAST_N_DAYS_CACHE = Number(process.env.LAST_N_DAYS_CACHE || 30);
+const WEEK_CACHE_TTL_MS = Number(process.env.WEEK_CACHE_TTL_MS || 30 * 24 * 60 * 60 * 1000);
+
+
+function parseDayISOToNoonUTC(dayIso) {
+  // "YYYY-MM-DD" -> Date estable (evita DST)
+  return new Date(`${dayIso}T12:00:00.000Z`);
+}
+
+function diffDaysInTZ(dayIso, timeZone) {
+  const todayIso = getTodayISOInTZ(timeZone);
+  const a = parseDayISOToNoonUTC(todayIso).getTime();
+  const b = parseDayISOToNoonUTC(dayIso).getTime();
+  return Math.floor((a - b) / (24 * 60 * 60 * 1000));
+}
+
+// ✅ "del día actual hacia atrás" = [0..N-1]
+// pero aquí: cache SOLO días pasados => [1..N-1] (hoy queda aparte)
+function isInLastNDaysBackExcludingToday(dayIso, timeZone, n = 7) {
+  const d = diffDaysInTZ(dayIso, timeZone);
+  return d >= 1 && d <= (n - 1);
+}
+
+function isTodayDay(dayIso, timeZone) {
+  return isToday(dayIso, timeZone);
+}
+
+function makeCacheKey(day, useFechaCreacion) {
+  return dayCacheKey(day, useFechaCreacion); // usa tu helper existente
+}
+
+// ✅ decide si guardamos cache para ese day/mode
+function canCache(dayIso, timeZone) {
+  if (isTodayDay(dayIso, timeZone)) return true; // hoy como ya lo tienes
+  return isInLastNDaysBackExcludingToday(dayIso, timeZone, LAST_N_DAYS_CACHE);
+}
+
+function ttlForDay(dayIso, timeZone) {
+  if (isTodayDay(dayIso, timeZone)) return RESULT_CACHE_TTL_MS;
+  return WEEK_CACHE_TTL_MS;
+}
+
+function cacheGetIfAllowed(day, useFechaCreacion) {
+  // si es >7 días atrás, no sirve cache (y lo limpiamos si existe)
+  if (!canCache(day, TZ)) {
+    resultadoDiaCache.delete(makeCacheKey(day, useFechaCreacion));
+    return null;
+  }
+
+  const key = makeCacheKey(day, useFechaCreacion);
+  const hit = resultadoDiaCache.get(key);
+  if (!hit) return null;
+
+  const ttl = ttlForDay(day, TZ);
+  if (Date.now() - (hit.ts || 0) >= ttl) {
+    resultadoDiaCache.delete(key);
+    return null;
+  }
+
+  return hit;
+}
+
+function cacheSetIfAllowed(day, useFechaCreacion, users) {
+  if (!canCache(day, TZ)) return; // >7 días atrás => NO cachear
+
+  const key = makeCacheKey(day, useFechaCreacion);
+  resultadoDiaCache.set(key, {
+    users,
+    ts: Date.now(),
+    useFechaCreacion,
+  });
+}
+
+// ===============================
+// ✅ WARMUP automático (sin front)
+//  - Boot: si falta cache => lo genera
+//  - Diario 09:00 CDMX => lo genera (force o only-missing)
+// ===============================
+
+const WARMUP_ENABLED = String(process.env.WARMUP_ENABLED || "true").toLowerCase() === "true";
+const WARMUP_DAYS = Math.max(2, Math.min(90, Number(process.env.WARMUP_DAYS || LAST_N_DAYS_CACHE || 30))); // hoy-1..hoy-(N-1)
+const WARMUP_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.WARMUP_CONCURRENCY || 1)));
+const WARMUP_HOUR = Number(process.env.WARMUP_HOUR || 9);
+const WARMUP_MINUTE = Number(process.env.WARMUP_MINUTE || 0);
+const WARMUP_FORCE_AT_9 = String(process.env.WARMUP_FORCE_AT_9 || "false").toLowerCase() === "true";
+
+let warmInFlight = null;
+let lastWarmupLocalDay = null;
+
+function addDaysISOInTZ(dayIso, timeZone, days) {
+  // dayIso = "YYYY-MM-DD"
+  const base = new Date(`${dayIso}T12:00:00.000Z`);
+  const moved = new Date(base.getTime() + days * 86400000);
+  return getTodayFormatter(timeZone).format(moved);
+}
+
+function lastNDaysBackExcludingTodayISO(n, timeZone) {
+  const out = [];
+  const todayIso = getTodayISOInTZ(timeZone);
+  for (let i = 1; i <= n - 1; i++) out.push(addDaysISOInTZ(todayIso, timeZone, -i));
+  return out;
+}
+
+function isWarmupMissing() {
+  const days = lastNDaysBackExcludingTodayISO(WARMUP_DAYS, TZ);
+  for (const day of days) {
+    const hit = cacheGetIfAllowed(day, true); // pasado = hecho
+    if (!hit || !Array.isArray(hit.users) || hit.users.length === 0) return true;
+  }
+  return false;
+}
+
+async function warmupLastDaysCaches({ force = false } = {}) {
+  if (!WARMUP_ENABLED) return { ok: false, reason: "disabled" };
+  if (warmInFlight) return warmInFlight;
+
+  warmInFlight = (async () => {
+    const days = lastNDaysBackExcludingTodayISO(WARMUP_DAYS, TZ);
+
+    if (!force && !isWarmupMissing()) {
+      return { ok: true, skipped: true, reason: "already_warm", days: days.length };
+    }
+
+    console.log(`[warmup] start force=${force} days=${days.length}`);
+
+    const results = await mapLimit(days, WARMUP_CONCURRENCY, async (day) => {
+      try {
+        // día pasado => procesarDia internamente usa lógica de BÚSQUEDA porque !isToday(day)
+        const r = await procesarDia(day, false);
+        if (r?.error) return { day, ok: false, error: r.error };
+
+        // guardamos cache como "hecho" (useFechaCreacion=true)
+        cacheSetIfAllowed(day, true, r.users);
+        return { day, ok: true, users: r.users?.length || 0 };
+      } catch (e) {
+        return { day, ok: false, error: e?.message || String(e) };
+      }
+    });
+
+    const okDays = results.filter((x) => x.ok).length;
+    console.log(`[warmup] done okDays=${okDays}/${results.length}`);
+    return { ok: true, okDays, results };
+  })();
+
+  try {
+    return await warmInFlight;
+  } finally {
+    warmInFlight = null;
+  }
+}
+
+function tickDailyWarmup() {
+  if (!WARMUP_ENABLED) return;
+
+  const lp = getLocalParts(new Date(), TZ);
+  if (!lp) return;
+
+  const nowMin = (lp.hour * 60) + lp.minute;
+  const targetMin = (WARMUP_HOUR * 60) + WARMUP_MINUTE;
+
+  // corre una vez por día cuando llegue a 09:00 (o la hora que pongas)
+  if (nowMin === targetMin && lastWarmupLocalDay !== lp.date) {
+    lastWarmupLocalDay = lp.date;
+    warmupLastDaysCaches({ force: WARMUP_FORCE_AT_9 }).catch((e) =>
+      console.error("[warmup@daily] error:", e?.message || e)
+    );
+  }
+}
+
+// ✅ Boot recovery: si falta cache, calienta en cuanto levante
+if (WARMUP_ENABLED) {
+  setTimeout(() => {
+    warmupLastDaysCaches({ force: false }).catch(() => {});
+  }, 1500).unref?.();
+
+  // ✅ scheduler simple: check cada 30s (DST-safe y sin libs)
+  setInterval(tickDailyWarmup, 30_000).unref?.();
+}
+
+// (opcional) endpoint manual
+router.post("/warmup/run", async (req, res) => {
+  const force = String(req.query.force || "false").toLowerCase() === "true";
+  const r = await warmupLastDaysCaches({ force });
+  res.json(r);
+});
+
+function pruneResultadoDiaCache() {
+  const now = Date.now();
+
+  for (const [key, entry] of resultadoDiaCache.entries()) {
+    const day = String(key).split("|")[0] || "";
+    const useFechaCreacion = String(key).endsWith("|hecho"); // aproximación, pero mejor parsear:
+    // mejor: detecta modo exacto
+    // key = `${day}|agenda` o `${day}|hecho`
+
+    // fuera de ventana => delete directo
+    if (!canCache(day, TZ)) {
+      resultadoDiaCache.delete(key);
+      continue;
+    }
+
+    const ttl = ttlForDay(day, TZ);
+    if (now - Number(entry?.ts || 0) >= ttl) {
+      resultadoDiaCache.delete(key);
+      continue;
+    }
+  }
+}
+
+// prune periódico (no bloquea el proceso)
+const PRUNE_MS = Number(process.env.RESULT_PRUNE_MS || 10 * 60 * 1000);
+setInterval(pruneResultadoDiaCache, PRUNE_MS).unref?.();
+
+// ===============================
+// ✅ Warmup híbrido:
+//  - Diario 09:00 CDMX
+//  - Al boot si falta cache (auto-recovery)
+// ===============================
+
+
+
+function addDaysISOInTZ(dayIso, timeZone, days) {
+  const base = parseDayISOToNoonUTC(dayIso);
+  const moved = new Date(base.getTime() + days * 24 * 60 * 60 * 1000);
+  return getTodayFormatter(timeZone).format(moved);
+}
+
+function lastNDaysBackExcludingTodayISO(n, timeZone) {
+  const out = [];
+  const todayIso = getTodayISOInTZ(timeZone);
+  for (let i = 1; i <= n - 1; i++) out.push(addDaysISOInTZ(todayIso, timeZone, -i));
+  return out;
+}
+
+// ✅ Decide si faltan caches de días pasados (hoy-1..hoy-6)
+// Esto es lo que dispara el auto-recovery tras reinicio.
+function isWarmupMissing() {
+  const days = lastNDaysBackExcludingTodayISO(WARMUP_DAYS, TZ);
+
+  // buscamos el modo "pasado" => useFechaCreacion=true
+  for (const day of days) {
+    const hit = (typeof cacheGetIfAllowed === "function")
+      ? cacheGetIfAllowed(day, true)
+      : resultadoDiaCache.get(dayCacheKey(day, true));
+
+    if (!hit || !Array.isArray(hit.users) || hit.users.length === 0) return true;
+  }
+  return false;
+}
+
+async function warmupLastDaysCaches({ force = false } = {}) {
+  if (!WARMUP_ENABLED) return { ok: false, reason: "disabled" };
+  if (warmInFlight) return warmInFlight;
+
+  warmInFlight = (async () => {
+    const days = lastNDaysBackExcludingTodayISO(WARMUP_DAYS, TZ);
+
+    // Si no forzamos y ya está completo, no hacemos nada.
+    if (!force && !isWarmupMissing()) {
+      return { ok: true, skipped: true, reason: "cache_already_present", days: days.length };
+    }
+
+    console.log(`[warmup] start force=${force} days=${days.length} (${days[0]} .. ${days[days.length - 1]})`);
+
+    const results = await mapLimit(days, WARMUP_CONCURRENCY, async (day) => {
+      try {
+        // día pasado => procesarDia usa BÚSQUEDA internamente (useFechaCreacion=true)
+        const r = await procesarDia(day, false);
+        if (r?.error) return { day, ok: false, error: r.error };
+
+        // cache de pasado => useFechaCreacion=true
+        if (typeof cacheSetIfAllowed === "function") {
+          cacheSetIfAllowed(day, true, r.users);
+        } else {
+          const key = dayCacheKey(day, true);
+          resultadoDiaCache.set(key, { users: r.users, ts: Date.now(), useFechaCreacion: true });
+        }
+
+        return { day, ok: true, users: r.users?.length || 0 };
+      } catch (e) {
+        return { day, ok: false, error: e?.message || String(e) };
+      }
+    });
+
+    const ok = results.filter((x) => x.ok).length;
+    const bad = results.length - ok;
+
+    console.log(`[warmup] done ok=${ok} bad=${bad}`);
+    return { ok: true, okDays: ok, badDays: bad, results };
+  })();
+
+  try {
+    return await warmInFlight;
+  } finally {
+    warmInFlight = null;
+  }
+}
+
+// ===== Scheduler diario 09:00 CDMX (DST-safe) =====
+
+function toDayIndexUTC(y, m, d) {
+  return Math.floor(Date.UTC(y, m - 1, d) / 86400000);
+}
+
+function parseISODateParts(iso) {
+  const [y, m, d] = String(iso).split("-").map((n) => Number(n));
+  return { y, m, d };
+}
+
+function utcForLocalTime(timeZone, isoDay, hour, minute) {
+  const { y, m, d } = parseISODateParts(isoDay);
+  const targetDayIdx = toDayIndexUTC(y, m, d);
+  const targetMinutes = targetDayIdx * 1440 + hour * 60 + minute;
+
+  let guess = Date.UTC(y, m - 1, d, hour, minute, 0, 0);
+
+  for (let i = 0; i < 6; i++) {
+    const lp = getLocalParts(new Date(guess), timeZone);
+    if (!lp) break;
+
+    const { y: ly, m: lm, d: ld } = parseISODateParts(lp.date);
+    const localDayIdx = toDayIndexUTC(ly, lm, ld);
+    const localMinutes = localDayIdx * 1440 + lp.hour * 60 + lp.minute;
+
+    const deltaMin = localMinutes - targetMinutes;
+    if (deltaMin === 0) return guess;
+
+    guess -= deltaMin * 60 * 1000;
+  }
+  return guess;
+}
+
+function msUntilNextDailyRun(timeZone, hour, minute) {
+  const now = Date.now();
+  const lp = getLocalParts(new Date(now), timeZone);
+  if (!lp) return 60_000;
+
+  let targetDay = lp.date;
+
+  const nowMin = lp.hour * 60 + lp.minute;
+  const targetMin = hour * 60 + minute;
+
+  if (nowMin >= targetMin) targetDay = addDaysISOInTZ(targetDay, timeZone, 1);
+
+  const targetUtc = utcForLocalTime(timeZone, targetDay, hour, minute);
+  const delay = targetUtc - now;
+  return delay > 0 ? delay : 60_000;
+}
+
+function scheduleDailyWarmup() {
+  if (!WARMUP_ENABLED) return;
+
+  const delay = msUntilNextDailyRun(TZ, WARMUP_HOUR, WARMUP_MINUTE);
+  console.log(`[warmup@${String(WARMUP_HOUR).padStart(2, "0")}:${String(WARMUP_MINUTE).padStart(2, "0")}] next in ~${Math.round(delay / 60000)} min`);
+
+  setTimeout(async () => {
+    try {
+      await warmupLastDaysCaches({ force: WARMUP_FORCE_AT_9 });
+    } catch (e) {
+      console.error("[warmup@daily] fatal:", e?.message || e);
+    } finally {
+      scheduleDailyWarmup(); // recalcula (DST-safe)
+    }
+  }, delay).unref?.();
+}
+
+// ✅ Auto-recovery al boot: si falta cache, calienta inmediatamente
+if (WARMUP_ENABLED) {
+  setTimeout(() => {
+    warmupLastDaysCaches({ force: false }).catch(() => {});
+  }, 2_000).unref?.();
+
+  // ✅ Scheduler diario a las 09:00
+  scheduleDailyWarmup();
+}
+
+// (opcional) endpoint manual/debug
+router.post("/warmup/run", async (req, res) => {
+  const force = String(req.query.force || "false").toLowerCase() === "true";
+  const r = await warmupLastDaysCaches({ force });
+  res.json(r);
+});
+
 
 // ✅ RUTA 1 (con cache + stale por usuario) — ACTUALIZADA
 router.get("/hoy", async (req, res) => {
@@ -904,39 +1293,37 @@ router.get("/hoy", async (req, res) => {
     const useFechaCreacion = useBusquedaLogic || !isCurrentDay;
 
     const cacheKey = dayCacheKey(day, useFechaCreacion);
-    const cached = resultadoDiaCache.get(cacheKey);
+
+    // 🔁 antes: const cached = resultadoDiaCache.get(cacheKey);
+    const cached = cacheGetIfAllowed(day, useFechaCreacion);
 
     const stale = peekStaleForDay(day);
 
-    // 0) Si ya hay cache, SIEMPRE intenta servirlo (aunque esté "viejo")
-    //    y aplicar partial/full desde RAW sin WL.
     if (cached && cached.useFechaCreacion === useFechaCreacion) {
       const raw = getDayRaw(day);
 
-      // Si no hay RAW, no podemos recomputar; devolvemos cache tal cual.
       if (!raw?.colaboradoresRaw || !raw?.actividadesById) {
         return res.json({
           date: day,
           users: cached.users,
-          meta: { fromCache: true, rawMissing: true, stale: { all: stale.all, dayStale: stale.dayStale, users: stale.users.size } },
+          meta: {
+            fromCache: true,
+            rawMissing: true,
+            stale: { all: stale.all, dayStale: stale.dayStale, users: stale.users.size },
+          },
         });
       }
 
-      // 0.a) Si el día entero está stale (o all), reconstruye FULL desde RAW (sin WL)
       if (stale.all || stale.dayStale) {
         const users = await buildUsersFromRaw({ day, useFechaCreacion, raw });
 
-        resultadoDiaCache.set(cacheKey, {
-          users,
-          ts: Date.now(),
-          useFechaCreacion,
-        });
+        // 🔁 antes: resultadoDiaCache.set(cacheKey, {...})
+        cacheSetIfAllowed(day, useFechaCreacion, users);
 
         clearStaleDay(day);
         return res.json({ date: day, users, meta: { fromCache: true, rebuilt: "full_from_raw" } });
       }
 
-      // 0.b) Usuarios stale => partial rebuild desde RAW (sin WL)
       if (stale.users.size > 0) {
         const byUserId = new Map(cached.users.map((u) => [u.user_id, u]));
 
@@ -946,7 +1333,7 @@ router.get("/hoy", async (req, res) => {
             useFechaCreacion,
             uid,
             raw.actividadesById,
-            raw.colaboradoresRaw,
+            raw.colaboradoresRaw
           );
 
           if (!updated) byUserId.delete(uid);
@@ -958,45 +1345,32 @@ router.get("/hoy", async (req, res) => {
         const users = Array.from(byUserId.values());
         users.sort((a, b) => (b.tiempo_total || 0) - (a.tiempo_total || 0));
 
-        resultadoDiaCache.set(cacheKey, {
-          users,
-          ts: Date.now(),
-          useFechaCreacion,
-        });
-
+        cacheSetIfAllowed(day, useFechaCreacion, users);
         return res.json({ date: day, users, meta: { fromCache: true, rebuilt: "partial_from_raw" } });
       }
 
-      // 0.c) Cache limpio
       return res.json({ date: day, users: cached.users, meta: { fromCache: true } });
     }
 
     // 1) No hay cache para ese modo.
-    //    Si YA existe RAW del día => construye FULL desde RAW (sin WL) y cachea.
     const raw = getDayRaw(day);
     if (raw?.colaboradoresRaw && raw?.actividadesById) {
       const users = await buildUsersFromRaw({ day, useFechaCreacion, raw });
 
-      resultadoDiaCache.set(cacheKey, {
-        users,
-        ts: Date.now(),
-        useFechaCreacion,
-      });
+      cacheSetIfAllowed(day, useFechaCreacion, users);
 
-      // ojo: no limpies stale.users aquí; solo dayStale/all si lo necesitas
       if (stale.dayStale || stale.all) clearStaleDay(day);
-
       return res.json({ date: day, users, meta: { fromCache: true, built: "full_from_raw" } });
     }
 
-    // 2) No hay RAW: permitimos SOLO 1 seed WL por día (en este proceso)
-    // ✅ pon esto en su lugar
-    // ✅ por esto
+    // 2) seed in-flight igual
     if (seedInFlight.has(day)) {
       await seedInFlight.get(day);
-      const raw = getDayRaw(day);
-      if (raw?.colaboradoresRaw && raw?.actividadesById) {
-        const users = await buildUsersFromRaw({ day, useFechaCreacion, raw });
+      const raw2 = getDayRaw(day);
+      if (raw2?.colaboradoresRaw && raw2?.actividadesById) {
+        const users = await buildUsersFromRaw({ day, useFechaCreacion, raw: raw2 });
+
+        cacheSetIfAllowed(day, useFechaCreacion, users);
         return res.json({ date: day, users, meta: { fromCache: false, waited: true } });
       }
     }
@@ -1021,13 +1395,8 @@ router.get("/hoy", async (req, res) => {
       return res.status(502).json({ error: "Upstream WL failed", detail: resultado.error });
     }
 
-    resultadoDiaCache.set(cacheKey, {
-      users: resultado.users,
-      ts: Date.now(),
-      useFechaCreacion,
-    });
-
-
+    // 🔁 antes: resultadoDiaCache.set(cacheKey, {...})
+    cacheSetIfAllowed(day, useFechaCreacion, resultado.users);
 
     clearStaleDay(day);
     return res.json({ date: resultado.date, users: resultado.users, meta: { fromCache: false, seeded: true } });
@@ -1035,7 +1404,6 @@ router.get("/hoy", async (req, res) => {
     return res.status(500).json({ error: err?.message || String(err) });
   }
 });
-
 
 
 // ✅ RUTA 2
@@ -1181,20 +1549,26 @@ router.get("/debug/cache/peek", (req, res) => {
 });
 
 
-// al final de productividad.js
+// ===============================
+// ✅ CAMBIO en updateCachedUsers: no actualizar fuera de ventana
+// ===============================
 function updateCachedUsers(day, useFechaCreacion, updatedUsers) {
+  if (!canCache(day, TZ)) return;
+
   const cacheKey = dayCacheKey(day, useFechaCreacion);
-  const cached = resultadoDiaCache.get(cacheKey);
+
+  // 🔁 antes: const cached = resultadoDiaCache.get(cacheKey);
+  const cached = cacheGetIfAllowed(day, useFechaCreacion);
   if (!cached) return;
 
-  const byId = new Map(cached.users.map((u) => [u.user_id, u]));
+  const byId = new Map((cached.users || []).map((u) => [u.user_id, u]));
   for (const u of updatedUsers) {
     byId.set(u.user_id, { ...(byId.get(u.user_id) || {}), ...u });
   }
-  const users = Array.from(byId.values())
-    .sort((a, b) => (b.tiempo_total || 0) - (a.tiempo_total || 0));
 
-  resultadoDiaCache.set(cacheKey, { ...cached, users, ts: Date.now() });
+  const users = Array.from(byId.values()).sort((a, b) => (b.tiempo_total || 0) - (a.tiempo_total || 0));
+
+  cacheSetIfAllowed(day, useFechaCreacion, users);
 }
 
 module.exports = router;
