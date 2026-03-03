@@ -5,7 +5,7 @@ const axios = require("axios");
 const { consumeStaleForDay } = require("../src/realtime/staleStore");
 const { peekStaleForDay, clearStaleUser, clearStaleDay } = require("../src/realtime/staleStore");
 const { setDayRaw, getDayRaw, hasDayRaw, } = require("../src/realtime/rawStore");
-
+const { setDayScore, getScoreSeriesForUser, getAllUserIds } = require("../src/realtime/productivityHistory");
 
 const router = express.Router();
 
@@ -966,7 +966,7 @@ function cacheGetIfAllowed(day, useFechaCreacion) {
 }
 
 function cacheSetIfAllowed(day, useFechaCreacion, users) {
-  if (!canCache(day, TZ)) return; // >7 días atrás => NO cachear
+  if (!canCache(day, TZ)) return;
 
   const key = makeCacheKey(day, useFechaCreacion);
   resultadoDiaCache.set(key, {
@@ -974,6 +974,11 @@ function cacheSetIfAllowed(day, useFechaCreacion, users) {
     ts: Date.now(),
     useFechaCreacion,
   });
+
+  // Registrar score diario en historial para el modelo AR(1)
+  if (Array.isArray(users) && users.length > 0) {
+    setDayScore(day, users);
+  }
 }
 
 // ===============================
@@ -999,10 +1004,22 @@ function addDaysISOInTZ(dayIso, timeZone, days) {
   return getTodayFormatter(timeZone).format(moved);
 }
 
+function isWeekend(isoDay) {
+  const d = new Date(`${isoDay}T12:00:00.000Z`);
+  const dow = d.getUTCDay();
+  return dow === 0 || dow === 6;
+}
+
 function lastNDaysBackExcludingTodayISO(n, timeZone) {
   const out = [];
   const todayIso = getTodayISOInTZ(timeZone);
-  for (let i = 1; i <= n - 1; i++) out.push(addDaysISOInTZ(todayIso, timeZone, -i));
+  let i = 1;
+  while (out.length < n - 1) {
+    const day = addDaysISOInTZ(todayIso, timeZone, -i);
+    if (!isWeekend(day)) out.push(day);
+    i++;
+    if (i > 90) break;
+  }
   return out;
 }
 
@@ -1171,7 +1188,13 @@ function addDaysISOInTZ(dayIso, timeZone, days) {
 function lastNDaysBackExcludingTodayISO(n, timeZone) {
   const out = [];
   const todayIso = getTodayISOInTZ(timeZone);
-  for (let i = 1; i <= n - 1; i++) out.push(addDaysISOInTZ(todayIso, timeZone, -i));
+  let i = 1;
+  while (out.length < n - 1) {
+    const day = addDaysISOInTZ(todayIso, timeZone, -i);
+    if (!isWeekend(day)) out.push(day);
+    i++;
+    if (i > 90) break;
+  }
   return out;
 }
 
@@ -1635,6 +1658,74 @@ function updateCachedUsers(day, useFechaCreacion, updatedUsers) {
 
   cacheSetIfAllowed(day, useFechaCreacion, users);
 }
+
+
+router.get("/prediccion-manana", async (req, res) => {
+  try {
+    const userIds = getAllUserIds();
+
+    if (userIds.length === 0) {
+      return res.json({
+        mensaje: "historial_insuficiente",
+        detalle: "Aún no hay historial acumulado. Consulta /hoy al menos 2 días.",
+        predicciones: [],
+      });
+    }
+
+    const PYTHON_URL = process.env.PYTHON_API_URL || "http://localhost:8000";
+    const predicciones = [];
+    const errores = [];
+
+    for (const userId of userIds) {
+      const history = getScoreSeriesForUser(userId); // [{ day, score }, ...]
+
+      if (history.length < 2) {
+        // usuario sin suficiente historial — lo saltamos
+        continue;
+      }
+
+      try {
+        const response = await axios.post(`${PYTHON_URL}/predict-tomorrow`, {
+          user_id: userId,
+          history,
+        });
+
+        predicciones.push(response.data);
+      } catch (userErr) {
+        errores.push({ userId, error: userErr.message });
+      }
+    }
+
+    if (predicciones.length === 0) {
+      return res.json({
+        mensaje: "historial_insuficiente",
+        detalle: "Ningún usuario tiene al menos 2 días de historial todavía.",
+        predicciones: [],
+      });
+    }
+
+    // Resumen del equipo basado en predicciones individuales
+    const productivos = predicciones.filter((p) => p.label === "productivo").length;
+    const regulares   = predicciones.filter((p) => p.label === "regular").length;
+    const noProductivos = predicciones.filter((p) => p.label === "no_productivo").length;
+
+    return res.json({
+      mensaje: "ok",
+      total_usuarios: predicciones.length,
+      resumen_equipo: {
+        productivos,
+        regulares,
+        no_productivos: noProductivos,
+      },
+      predicciones, // array individual: [{ user_id, score_predicho, label, phi, c, n_observaciones, score_hoy }]
+      errores: errores.length > 0 ? errores : undefined,
+    });
+
+  } catch (err) {
+    console.error("[prediccion-manana] Error:", err.message);
+    res.status(500).json({ error: "Error al calcular predicción", detalle: err.message });
+  }
+});
 
 module.exports = router;
 module.exports.recomputarFilaUsuario = recomputarFilaUsuario;
