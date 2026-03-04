@@ -74,6 +74,45 @@ function isNotFutureDate(dateStr) {
   return t <= (Date.now() + FUTURE_SKEW_MS);
 }
 
+function stripFutureRevisionsFromDetalle(detalle, dayIso, timeZone = TZ) {
+  if (!detalle || typeof detalle !== "object") return detalle;
+  if (!isToday(dayIso, timeZone)) return detalle;
+
+  const actividades = Array.isArray(detalle.actividades) ? detalle.actividades : [];
+
+  const fixedActs = actividades.map((act) => {
+    const revs = act?.revisiones || {};
+    const out = { terminadas: [], confirmadas: [], pendientes: [] };
+
+    for (const bucket of ["terminadas", "confirmadas", "pendientes"]) {
+      const arr = Array.isArray(revs[bucket]) ? revs[bucket] : [];
+      out[bucket] = arr.filter((r) => {
+        // ✅ Intenta ambas rutas: objeto normalizado y raw
+        const fc = r?.fechaCreacion ?? r?.raw?.fechaCreacion ?? r?.raw?.createdAt ?? r?.createdAt ?? null;
+
+        if (!fc) return false;
+
+        const t = new Date(fc).getTime();
+        if (Number.isNaN(t)) return false;
+
+        // ❌ Rechaza si es futuro (con margen de 2 min)
+        if (t > Date.now() + FUTURE_SKEW_MS) return false;
+
+        // ❌ Rechaza si la fecha local en CDMX es posterior al día consultado
+        const local = getLocalParts(new Date(fc), timeZone);
+        if (!local) return false;
+        if (isoToDayIndexUTC(local.date) > isoToDayIndexUTC(dayIso)) return false;
+
+        return true;
+      });
+    }
+
+    return { ...act, revisiones: out };
+  });
+
+  return { ...detalle, actividades: fixedActs };
+}
+
 function isoToDayIndexUTC(isoDay) {
   // isoDay: YYYY-MM-DD (comparación estable, evita DST)
   const [y, m, d] = String(isoDay).split("-").map(Number);
@@ -99,8 +138,11 @@ function isOnOrBeforeDayInTZ(dateStr, dayIso, timeZone) {
 function passRevisionFilterUpToDay(rev, dayIso, timeZone) {
   const fc = revisionFechaStr(rev);
   if (!fc) return false;
-  if (!isNotFutureDate(fc)) return false;          // ❌ nunca futuras
-  if (!isOnOrBeforeDayInTZ(fc, dayIso, timeZone)) return false; // ✅ <= day
+
+  const local = getLocalParts(new Date(fc), timeZone);
+  if (!local) return false;
+  if (isoToDayIndexUTC(local.date) > isoToDayIndexUTC(dayIso)) return false;
+
   return true;
 }
 
@@ -231,6 +273,24 @@ function pruneMapToMaxSize(map, max) {
     map.delete(k);
     if (++i >= over) break;
   }
+}
+
+// ✅ DETALLE: solo revisiones del MISMO day (CDMX) y NO futuras
+function passRevisionFilterDetalleSameDay(rev, dayIso, timeZone, hours = "all") {
+  const fc = revisionFechaStr(rev);
+  if (!fc) return false;
+
+  // ❌ bloquear timestamps futuros (aunque sean del mismo día)
+  if (!isNotFutureDate(fc)) return false;
+
+  // ✅ exigir que caiga en el mismo día (en TZ CDMX)
+  const local = getLocalParts(new Date(fc), timeZone);
+  if (!local || local.date !== dayIso) return false;
+
+  // hours=work: 09:00-17:00 local (mismo día)
+  if (hours === "work") return isFechaCreacionBetween9and5Local(fc, dayIso, timeZone).ok;
+
+  return true;
 }
 
 // ---- domain helpers ----
@@ -639,6 +699,34 @@ async function mapLimit(items, limit, mapper) {
   return out;
 }
 
+function isBetweenWorkHoursOnlyLocal(dateStr, timeZone, noDateReason = "no_date") {
+  if (!dateStr) return { ok: false, reason: noDateReason };
+
+  const dt = new Date(dateStr);
+  const local = getLocalParts(dt, timeZone);
+  if (!local) return { ok: false, reason: "bad_date" };
+
+  const minutes = local.hour * 60 + local.minute;
+  if (minutes < START_MIN) return { ok: false, reason: "before_9" };
+  if (minutes >= END_MIN) return { ok: false, reason: "after_5" };
+
+  return { ok: true, reason: "ok" };
+}
+
+// ✅ NUEVO: filtro detalle = hoy y anteriores (<= day) y no futuras
+// ✅ Acepta: hoy y días pasados. Rechaza: día de mañana en adelante.
+// ✅ Acepta: hoy y días pasados. Rechaza: día de mañana en adelante.
+function passRevisionFilterDetalleUpToDay(rev, dayIso, timeZone, hours = "all") {
+  const fc = revisionFechaStr(rev);
+  if (!fc) return false;
+
+  const local = getLocalParts(new Date(fc), timeZone);
+  if (!local) return false;
+  if (isoToDayIndexUTC(local.date) > isoToDayIndexUTC(dayIso)) return false;
+
+  return true; // ✅ sin filtro de horas — las revisiones no tienen restricción horaria
+}
+
 // ✅ FUNCIÓN AUXILIAR: Procesar un día
 async function procesarDia(day, useBusquedaLogic = false) {
   try {
@@ -879,23 +967,29 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
     const revisiones = { terminadas: [], confirmadas: [], pendientes: [] };
 
     if (useFechaCreacion) {
+      // Modo "hecho" / día pasado: solo terminadas
+      // Si es hoy en modo hecho: filtra futuras. Si es día pasado: acepta todas
       const terminadas = safeArray(a?.terminadas);
       for (const r of terminadas) {
+        if (isCurrentDay && !passRevisionFilterUpToDay(r, day, TZ)) continue;
         const norm = normalizeRevision(r);
         if (norm) revisiones.terminadas.push(norm);
       }
     } else {
-      for (const b of buckets) {
-        const revs = safeArray(a?.[b]);
-        for (const r of revs) {
-          const norm = normalizeRevision(r);
-          if (norm) revisiones[b].push(norm);
-        }
-      }
+  for (const b of buckets) {
+    const revs = safeArray(a?.[b]);
+    for (const r of revs) {
+      if (!passRevisionFilterDetalleUpToDay(r, day, TZ)) continue;
+      const norm = normalizeRevision(r);
+      if (norm) revisiones[b].push(norm);
     }
+  }
+}
 
     const total =
-      revisiones.terminadas.length + revisiones.confirmadas.length + revisiones.pendientes.length;
+      revisiones.terminadas.length +
+      revisiones.confirmadas.length +
+      revisiones.pendientes.length;
 
     if (total === 0) continue;
 
@@ -907,6 +1001,7 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
     });
   }
 
+  // ✅ El resumen se calcula SOBRE los datos ya filtrados
   let revisionesCount = 0;
   let conDur = 0;
   let sinDur = 0;
@@ -929,6 +1024,7 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
 
   const prediccion = await predecirConModelo(features);
 
+  // ✅ Todo ya está filtrado desde el origen — no necesitas un segundo paso
   return {
     date: day,
     user: { user_id: userId, colaborador: userName, email: info.email || "", phone: info.phone || "" },
@@ -940,7 +1036,7 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
       tiempo_total: minutos,
     },
     prediccion,
-    actividades: actividadesDetalle,
+    actividades: actividadesDetalle, // ✅ ya limpio desde el loop
     meta: { useFechaCreacion, isCurrentDay, hours },
   };
 }
@@ -1583,39 +1679,32 @@ router.get("/usuario/:userId", async (req, res) => {
 
     const dateParam = String(req.query.date || "").trim();
     const day = dateParam || getTodayISOInTZ(TZ);
-
     const hours = String(req.query.hours || "work").trim();
 
-    // mode=agenda|hecho|auto
     const mode = parseMode(req.query.mode);
     const resolvedMode = mode === "auto" ? getDefaultModeForDay(day) : mode;
-
-    // hecho => useBusquedaLogic=true
     const useBusquedaLogic = resolvedMode === "hecho";
 
-    // ✅ key incluye todo lo que cambia el resultado
     const key = detalleKey(day, userId, useBusquedaLogic, hours, resolvedMode);
 
-    // ✅ si el día está dentro de ventana (hoy o últimos N días), sirve cache
-    // (si no quieres cachear detalle fuera de ventana, lo respetamos)
+    // ✅ Cache — ya viene limpio desde el origen, no necesita strip
     if (canCache(day, TZ)) {
       const cached = detalleCacheGet(key, day);
       if (cached) {
         return res.json({ ...cached, meta: { ...(cached.meta || {}), fromCache: true } });
       }
     } else {
-      // si está fuera de ventana, asegúrate de no conservarlo
       detalleUsuarioCache.delete(key);
     }
 
-    // ✅ calcula normal
     const detalle = await procesarDetalleUsuarioDia(userId, day, useBusquedaLogic, hours);
+
     const payload = {
       ...detalle,
       meta: { ...detalle.meta, mode: resolvedMode, cutoffHour: SWITCH_CUTOFF_HOUR, fromCache: false },
     };
 
-    // ✅ guarda cache si aplica
+    // ✅ Guarda en cache ya limpio
     if (canCache(day, TZ)) {
       detalleCacheSet(key, day, payload);
     }
