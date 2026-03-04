@@ -60,6 +60,70 @@ async function buildUsersFromRaw({ day, useFechaCreacion, raw }) {
   return users;
 }
 
+// ---- FILTROS FECHA/REVISION (NUEVO) ----
+const FUTURE_SKEW_MS = Number(process.env.FUTURE_SKEW_MS || 2 * 60 * 1000);
+
+function revisionFechaStr(rev) {
+  return rev?.fechaCreacion ?? rev?.createdAt ?? null;
+}
+
+function isNotFutureDate(dateStr) {
+  if (!dateStr) return false;
+  const t = new Date(dateStr).getTime();
+  if (Number.isNaN(t)) return false;
+  return t <= (Date.now() + FUTURE_SKEW_MS);
+}
+
+function isoToDayIndexUTC(isoDay) {
+  // isoDay: YYYY-MM-DD (comparación estable, evita DST)
+  const [y, m, d] = String(isoDay).split("-").map(Number);
+  return Math.floor(Date.UTC(y, m - 1, d) / 86400000);
+}
+
+function isOnOrBeforeDayInTZ(dateStr, dayIso, timeZone) {
+  if (!dateStr) return false;
+
+  const local = getLocalParts(new Date(dateStr), timeZone);
+  if (!local?.date) return false;
+
+  const revIdx = isoToDayIndexUTC(local.date);
+  const dayIdx = isoToDayIndexUTC(dayIso);
+
+  return revIdx <= dayIdx;
+}
+
+/**
+ * ✅ BÚSQUEDA: permite revisiones del día consultado O días pasados (<= day)
+ * y bloquea fechas futuras (vs ahora).
+ */
+function passRevisionFilterUpToDay(rev, dayIso, timeZone) {
+  const fc = revisionFechaStr(rev);
+  if (!fc) return false;
+  if (!isNotFutureDate(fc)) return false;          // ❌ nunca futuras
+  if (!isOnOrBeforeDayInTZ(fc, dayIso, timeZone)) return false; // ✅ <= day
+  return true;
+}
+
+function isFutureDayInTZ(dayIso, timeZone) {
+  // diffDaysInTZ = today - day
+  // si day es futuro => today - future = negativo
+  return diffDaysInTZ(dayIso, timeZone) < 0;
+}
+
+// validar yyyy-mm-dd simple 
+function isValidIsoDay(day) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(day || ""));
+}
+
+function passRevisionFilterTodayOnly(rev, dayIso, timeZone) {
+  const fc = revisionFechaStr(rev);
+  if (!fc) return false;
+  if (!isNotFutureDate(fc)) return false;
+
+  const local = getLocalParts(new Date(fc), timeZone);
+  return !!local && local.date === dayIso;
+}
+
 // ---- caches ----
 
 // cache en memoria: userId -> { email, name, ts }
@@ -436,6 +500,8 @@ function procesarColaboradorDia_HOY(col, day, actividadesById) {
     for (const b of buckets) {
       const revs = Array.isArray(a?.[b]) ? a[b] : [];
       for (const r of revs) {
+        if (!passRevisionFilterTodayOnly(r, day, TZ)) continue;
+
         const dur = Number(r?.duracionMin ?? 0) || 0;
         revisiones += 1;
 
