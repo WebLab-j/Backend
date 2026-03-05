@@ -146,11 +146,14 @@ function passRevisionFilterUpToDay(rev, dayIso, timeZone) {
   const fc = revisionFechaStr(rev);
   if (!fc) return false;
 
-  const local = getLocalParts(new Date(fc), timeZone);
-  if (!local) return false;
-  if (isoToDayIndexUTC(local.date) > isoToDayIndexUTC(dayIso)) return false;
+  // 1) ❌ bloquear futuras vs "ahora"
+  if (!isNotFutureDate(fc)) return false;
 
-  return true;
+  // 2) ✅ permitir si la fecha local CDMX es <= dayIso
+  const local = getLocalParts(new Date(fc), timeZone);
+  if (!local?.date) return false;
+
+  return isoToDayIndexUTC(local.date) <= isoToDayIndexUTC(dayIso);
 }
 
 function isFutureDayInTZ(dayIso, timeZone) {
@@ -518,7 +521,7 @@ function procesarColaboradorDia_HOY(col, day, actividadesById, email = "") {
       const revs = Array.isArray(a?.[b]) ? a[b] : [];
       for (const r of revs) {
   // ✅ HOY: solo revisiones del mismo día (CDMX) y NO futuras
-  if (!passRevisionFilterTodayOnly(r, day, TZ)) continue;
+  if (!passRevisionFilterUpToDay(r, day, TZ)) continue;
 
   const dur = Number(r?.duracionMin ?? 0) || 0;
   revisiones += 1;
