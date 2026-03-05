@@ -517,16 +517,19 @@ function procesarColaboradorDia_HOY(col, day, actividadesById, email = "") {
     for (const b of buckets) {
       const revs = Array.isArray(a?.[b]) ? a[b] : [];
       for (const r of revs) {
-        const dur = Number(r?.duracionMin ?? 0) || 0;
-        revisiones += 1;
+  // ✅ HOY: solo revisiones del mismo día (CDMX) y NO futuras
+  if (!passRevisionFilterTodayOnly(r, day, TZ)) continue;
 
-        if (dur > 0) {
-          revisiones_con_duracion += 1;
-          minutos += dur;
-        } else {
-          revisiones_sin_duracion += 1;
-        }
-      }
+  const dur = Number(r?.duracionMin ?? 0) || 0;
+  revisiones += 1;
+
+  if (dur > 0) {
+    revisiones_con_duracion += 1;
+    minutos += dur;
+  } else {
+    revisiones_sin_duracion += 1;
+  }
+}
     }
   }
 
