@@ -198,6 +198,7 @@ function applyRevisionDeletedEvent(day, payload) {
 module.exports = {
   setDayRaw,
   getDayRaw,
+  hasDayRaw,
   applyRevisionEvent,
   applyRevisionDeletedEvent,
   listDays,

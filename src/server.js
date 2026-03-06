@@ -11,13 +11,14 @@ const axios = require("axios");
 const { syncRange } = require("./services/syncService");
 const { filterActividadesByWindow } = require("./utils/timeWindow");
 const { startWlSocketListener } = require("./realtime/wlSocketListener");
-const { applyRevisionEvent, applyRevisionDeletedEvent, findDaysWithActividad, getDayRaw } = require("./realtime/rawStore");
+const { applyRevisionEvent, applyRevisionDeletedEvent, findDaysWithActividad, getDayRaw, hasDayRaw } = require("./realtime/rawStore");
 const { upsertFromEvent, resolve } = require("./realtime/revisionIndex");
 const http = require("http");
 const { initUiSocket, emitDayUpdate, emitBroadcast } = require("./realtime/uiSocket");
-const { recomputarFilaUsuario, updateCachedUsers } = require("../api/productividad.hoy.routes");
+const { recomputarFilaUsuario, updateCachedUsers, upsertDetalleCacheFromRawForUsers } = require("../api/productividad.hoy.routes");
 // ✅ busca en actividadesCache directamente (siempre disponible si hubo fetch)
 const { fetchActividades } = require("../api/productividad.hoy.routes");
+
 
 
 
@@ -321,8 +322,7 @@ try {
         let userIds = extractUserIds(payload);
         let days = extractAffectedDays(payload);
 
-        
-        // 2) Si viene incompleto (muy común en creada/eliminada), intenta resolver con el índice
+        // 2) Resolver incompleto por índice
         if ((days.length === 0 || userIds.length === 0) && revisionId) {
           const fromIdx = resolve(revisionId);
           if (fromIdx) {
@@ -331,10 +331,9 @@ try {
           }
         }
 
-        // 3) Stale SIN tirar todo el sistema
+        // 3) Stale marks (lo tuyo)
         if (days.length === 0 && userIds.length === 0) {
-          // antes: markStaleAll()  ❌  => esto te obliga a recompute full (WL)
-          markStaleDay(today); // ✅ degradado pero seguro
+          markStaleDay(today);
         } else if (days.length === 0 && userIds.length > 0) {
           for (const uid of userIds) markStaleUser(today, uid);
         } else if (userIds.length === 0) {
@@ -343,104 +342,176 @@ try {
           for (const d of days) for (const uid of userIds) markStaleUser(d, uid);
         }
 
-        // 4) Patch RAW (si days viene vacío, parchea hoy al menos)
-        // 4) Patch RAW: además de "days" por fechas, parchea también los días que YA tienen esa actividad en el raw cache
-const patchDaysSet = new Set(days);
+        // 4) Decide días a parchear (dias por fechas + dias donde ya existe la actividad en raw)
+        // 4) Decide días a parchear (dias por fechas + dias donde ya existe la actividad en raw)
+        const patchDaysSet = new Set(days);
 
-// Si la actividad existe en raw cache de otros días, esos días también deben parchearse
-if (actividadId) {
-  const daysByActividad = findDaysWithActividad(actividadId); // <-- ya lo importas arriba
-  for (const d of daysByActividad) patchDaysSet.add(d);
-}
+        if (actividadId) {
+          const daysByActividad = findDaysWithActividad(actividadId);
 
-// fallback seguro
-if (patchDaysSet.size === 0) patchDaysSet.add(today);
-patchDaysSet.add(today);
-const daysForPatch = Array.from(patchDaysSet);
+          for (const d of daysByActividad) {
+            // ✅ solo si realmente tenemos RAW en memoria y/o si es cacheable
+            if (!hasDayRaw(d)) continue;     // <- necesitas importar hasDayRaw del rawStore
+            //if (!canCache(d, TZ)) continue; // <- opcional pero recomendado
+            patchDaysSet.add(d);
+          }
+        }
 
-if (eventName === "revision_creada" || eventName === "revision_actualizada") {
-  upsertFromEvent({ revisionId, days: [today], userIds, actividadId });
-}
+        if (patchDaysSet.size === 0) patchDaysSet.add(today);
+        patchDaysSet.add(today);
 
-// ✅ siempre parchea sobre el RAW de hoy
-let touchedUserIds = [];
-let actividadIdFromPatch = actividadId;
+        const daysForPatch = Array.from(patchDaysSet);
 
-if (eventName === "revision_creada" || eventName === "revision_actualizada") {
-  const r = applyRevisionEvent(today, payload);
-  touchedUserIds = Array.isArray(r?.touchedUserIds) ? r.touchedUserIds : [];
-  actividadIdFromPatch = r?.actividadId ?? actividadIdFromPatch;
-  console.log("[RAW PATCH]", { day: today, eventName, touched: touchedUserIds, actividadId: actividadIdFromPatch });
-}
+        // Index (lo tuyo)
+        if (eventName === "revision_creada" || eventName === "revision_actualizada") {
+          upsertFromEvent({ revisionId, days: [today], userIds, actividadId });
+        }
 
-if (eventName === "revision_eliminada") {
-  const r = applyRevisionDeletedEvent(today, payload);
-  touchedUserIds = Array.isArray(r?.touchedUserIds) ? r.touchedUserIds : [];
-  console.log("[RAW PATCH]", { day: today, eventName, touched: touchedUserIds, revisionId });
-}
+        // ✅ Patch RAW (IMPORTANTE: parchea TODOS los daysForPatch, no solo today)
+        const touchedByDay = new Map(); // day -> touchedUserIds[]
+        let actividadIdFromPatch = actividadId;
 
-if (touchedUserIds.length > 0) {
-  const raw = getDayRaw(today);
-  const updatedUsers = [];
+        for (const day of daysForPatch) {
+          if (eventName === "revision_creada" || eventName === "revision_actualizada") {
+            const r = applyRevisionEvent(day, payload);
+            const touched = Array.isArray(r?.touchedUserIds) ? r.touchedUserIds : [];
+            if (touched.length > 0) touchedByDay.set(day, touched);
+            actividadIdFromPatch = r?.actividadId ?? actividadIdFromPatch;
 
-  // ✅ determina el modo según el payload
-  const useFechaCreacion = payload?.terminadaPendienteRevision === true
-    || payload?.confirmacion === true
-    || !!payload?.fechaFinTerminada;
+            if (touched.length > 0) {
+              console.log("[RAW PATCH]", { day, eventName, touched, actividadId: actividadIdFromPatch });
+            }
+          }
 
-  if (raw?.actividadesById && raw?.colaboradoresRaw) {
-    for (const uid of touchedUserIds) {
-      try {
-        const fila = await recomputarFilaUsuario(
-          today, useFechaCreacion, uid,
-          raw.actividadesById,
-          raw.colaboradoresRaw,
-        );
-        if (fila) updatedUsers.push(fila);
-      } catch (e) {
-        console.error("[recompute]", uid, e?.message);
-      }
-    }
+          if (eventName === "revision_eliminada") {
+            const r = applyRevisionDeletedEvent(day, payload);
+            const touched = Array.isArray(r?.touchedUserIds) ? r.touchedUserIds : [];
+            if (touched.length > 0) touchedByDay.set(day, touched);
+
+            if (touched.length > 0) {
+              console.log("[RAW PATCH]", { day, eventName, touched, revisionId });
+            }
+          }
+        }
+
+        // Si nadie fue tocado en ningún día, no hay nada que hacer
+        if (touchedByDay.size === 0) {
+  const fallbackDays = (days && days.length) ? days : [today];
+  const fallbackUsers = (userIds && userIds.length) ? userIds : [];
+
+  const revisionInfo = {
+    nombreActividad: null,
+    nombreRevision: payload?.nombre ?? null,
+    horario: payload?.dueStart ?? null,
+  };
+
+  for (const d of fallbackDays) {
+    emitDayUpdate(d, {
+      kind: "detalle_changed",
+      day: d,
+      eventName,               // ✅
+      userIds: fallbackUsers,
+      actividadId,
+      revisionId,
+      ts: meta?.ts || new Date().toISOString(),
+      revisionInfo,            // ✅
+    });
   }
-  // después de calcular updatedUsers...
-// ✅ así debe quedar
-if (updatedUsers.length > 0) {
-  updateCachedUsers(today, true, updatedUsers);  // modo hecho
-  updateCachedUsers(today, false, updatedUsers); // modo agenda
+  return;
 }
-  console.log("[EMIT]", { today, updatedUsers: updatedUsers.length });
-  console.log("[PAYLOAD COMPLETO]", JSON.stringify(payload, null, 2));
-  console.log("[ACTIVIDAD BUSQUEDA]", {
-  actividadIdFromPatch,
-  tieneRaw: !!raw,
-  tieneActividadesById: !!raw?.actividadesById,
-  keys: Object.keys(raw?.actividadesById || {}).slice(0, 3),
-  encontrada: raw?.actividadesById?.[actividadIdFromPatch],
-});
-// ✅ busca el nombre de la actividad en el raw cache
 
-// ✅ busca título de actividad en colaboradoresRaw (siempre tiene datos)
-let actividadNombre = null;
-let actividadDueStart = null;
+        // ✅ Por cada día tocado: actualiza resultadoDiaCache + detalleCache + emit (si quieres)
+        for (const [day, touchedUserIds] of touchedByDay.entries()) {
+          const raw = getDayRaw(day);
+          if (!raw?.actividadesById || !raw?.colaboradoresRaw) continue;
 
-if (actividadIdFromPatch && raw?.actividadesById instanceof Map) {
+          // --------- (A) TU LOGICA: recomputar filas y actualizar resultadoDiaCache ----------
+          const updatedUsers = [];
+
+          const useFechaCreacion =
+            payload?.terminadaPendienteRevision === true ||
+            payload?.confirmacion === true ||
+            !!payload?.fechaFinTerminada;
+
+          for (const uid of touchedUserIds) {
+            try {
+              const fila = await recomputarFilaUsuario(
+                day,
+                useFechaCreacion,
+                uid,
+                raw.actividadesById,
+                raw.colaboradoresRaw,
+              );
+              if (fila) updatedUsers.push(fila);
+            } catch (e) {
+              console.error("[recompute]", uid, e?.message);
+            }
+          }
+
+          if (updatedUsers.length > 0) {
+            updateCachedUsers(day, true, updatedUsers);  // hecho
+            updateCachedUsers(day, false, updatedUsers); // agenda
+          }
+
+          // --------- (B) ✅ AQUI VA LO QUE TU QUIERES: actualizar cache DETALLE con el evento ----------
+          // Esto recalcula y sobreescribe el cache del detalle usando el RAW ya parcheado
+          try {
+            await Promise.all([
+              upsertDetalleCacheFromRawForUsers({ day, userIds: touchedUserIds, hours: "work", mode: "agenda" }),
+              upsertDetalleCacheFromRawForUsers({ day, userIds: touchedUserIds, hours: "work", mode: "hecho" }),
+              // opcional si usas cache por "auto"
+              upsertDetalleCacheFromRawForUsers({ day, userIds: touchedUserIds, hours: "work", mode: "auto" }),
+            ]);
+
+            console.log("[DETALLE CACHE UPSERT]", { day, users: touchedUserIds.length, modes: ["agenda", "hecho", "auto"] });
+          } catch (e) {
+            console.error("[DETALLE CACHE UPSERT] error:", e?.message || e);
+          }
+
+          // --------- debug correcto de Map (opcional) ----------
+          const keysSample =
+            raw.actividadesById instanceof Map
+              ? Array.from(raw.actividadesById.keys()).slice(0, 3)
+              : [];
+
+          const actInfo =
+            (raw.actividadesById instanceof Map && actividadIdFromPatch)
+              ? raw.actividadesById.get(actividadIdFromPatch)
+              : null;
+
+          console.log("[ACTIVIDAD BUSQUEDA]", {
+            day,
+            actividadIdFromPatch,
+            tieneRaw: !!raw,
+            tieneActividadesById: raw.actividadesById instanceof Map,
+            keys: keysSample,
+            encontrada: actInfo ?? null,
+          });
+
+          let nombreActividad = null;
+let horario = null;
+
+if (raw?.actividadesById instanceof Map && actividadIdFromPatch) {
   const act = raw.actividadesById.get(actividadIdFromPatch);
-  actividadNombre = act?.titulo ?? null;
-  actividadDueStart = act?.dueStart ?? null;
-}
-
-// fallback en colaboradoresRaw si el Map estaba vacío
-if (!actividadNombre && raw?.colaboradoresRaw) {
-  for (const col of raw.colaboradoresRaw) {
-    const acts = Array.isArray(col?.items?.actividades) ? col.items.actividades : [];
-    const act = acts.find((a) => a?.id === actividadIdFromPatch);
-    if (act?.titulo) { actividadNombre = act.titulo; break; }
+  if (act) {
+    nombreActividad = act?.titulo ?? null;
+    horario = act?.dueStart ?? null;
   }
 }
 
-emitDayUpdate(today, {
+// fallback si raw no tiene la actividad
+if (!horario) horario = payload?.dueStart ?? null;
+
+const revisionInfo = {
+  nombreActividad,
+  nombreRevision: payload?.nombre ?? null,
+  horario,
+};
+
+          // --------- emit al front (puedes mandar señal o datos) ----------
+          emitDayUpdate(day, {
   kind: "users_changed",
-  day: today,
+  day,
   eventName,
   userIds: touchedUserIds,
   actividadId: actividadIdFromPatch,
@@ -448,14 +519,21 @@ emitDayUpdate(today, {
   useFechaCreacion,
   ts: meta?.ts || new Date().toISOString(),
   updatedUsers,
-  revisionInfo: {
-    nombreRevision: payload?.nombre ?? null,
-    nombreActividad: actividadNombre,
-    horario: actividadDueStart, 
-  },
+  revisionInfo, // ✅
 });
-}
-        
+
+emitDayUpdate(day, {
+  kind: "detalle_changed",
+  day,
+  eventName, // ✅ MUY IMPORTANTE
+  userIds: touchedUserIds,
+  revisionId,
+  actividadId: actividadIdFromPatch,
+  ts: meta?.ts || new Date().toISOString(),
+  revisionInfo, // ✅
+});
+        }
+
         console.log("[STALE MARK]", {
           eventName,
           id: revisionId,

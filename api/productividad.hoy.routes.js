@@ -1171,6 +1171,80 @@ async function warmupLastDaysCaches({ force = false } = {}) {
   }
 }
 
+
+// ===============================
+// WARMUP DETALLE: cachea /usuario/:userId para los últimos N días
+// ===============================
+
+const WARMUP_DETALLE_ENABLED = String(process.env.WARMUP_DETALLE_ENABLED || "true").toLowerCase() === "true";
+const WARMUP_DETALLE_MODE = process.env.WARMUP_DETALLE_MODE || "hecho"; // siempre hecho para días pasados
+const WARMUP_DETALLE_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.WARMUP_DETALLE_CONCURRENCY || 2)));
+
+async function warmupDetalleForDay(day) {
+  console.log(`[warmup-detalle] procesando ${day}`);
+  try {
+    const colaboradoresRaw = await fetchColaboradores(day);
+    if (!Array.isArray(colaboradoresRaw) || colaboradoresRaw.length === 0) {
+      console.log(`[warmup-detalle] ${day} sin colaboradores`);
+      return { day, ok: false, reason: "no_colaboradores" };
+    }
+
+    const userIds = [...new Set(colaboradoresRaw.map((c) => c?.idAsignee).filter(Boolean))];
+    const usersInfo = await resolveUsersMap(userIds, 4);
+    const validUserIds = userIds.filter((id) => {
+      if (ALL_EXCLUDED_IDS.has(id)) return false;
+      return allowedByEmail(usersInfo.get(id)?.email || "");
+    });
+
+    console.log(`[warmup-detalle] ${day} usuarios válidos: ${validUserIds.length}`);
+
+    const useBusquedaLogic = true;
+    const hours = "work"; // ✅ igual que default de la ruta
+    const resolvedMode = "hecho";
+    let ok = 0, bad = 0;
+
+    await mapLimit(validUserIds, WARMUP_DETALLE_CONCURRENCY, async (userId) => {
+      const key = detalleKey(day, userId, useBusquedaLogic, hours, resolvedMode);
+      if (detalleCacheGet(key, day)) { ok++; return; }
+      try {
+        const detalle = await procesarDetalleUsuarioDia(userId, day, useBusquedaLogic, hours);
+        detalleCacheSet(key, day, {
+          ...detalle,
+          meta: { ...detalle.meta, mode: resolvedMode, cutoffHour: SWITCH_CUTOFF_HOUR, fromCache: false },
+        });
+        ok++;
+      } catch (e) {
+        console.error(`[warmup-detalle] ${day} userId=${userId}:`, e?.message);
+        bad++;
+      }
+    });
+
+    console.log(`[warmup-detalle] ${day} ✅ ok=${ok} bad=${bad} total=${validUserIds.length}`);
+    return { day, ok, bad, total: validUserIds.length };
+  } catch (e) {
+    console.error(`[warmup-detalle] ${day} error:`, e?.message);
+    return { day, ok: false, reason: e?.message };
+  }
+}
+
+async function warmupDetalleLastDays({ force = false } = {}) {
+  if (!WARMUP_DETALLE_ENABLED) return { ok: false, reason: "disabled" };
+
+  const days = lastNDaysBackExcludingTodayISO(WARMUP_DAYS, TZ);
+
+  console.log(`[warmup-detalle] start force=${force} days=${days.length}`);
+
+  // Primero aseguramos que el warmup de resultados esté completo
+  await warmupLastDaysCaches({ force });
+
+  // Luego cachear detalle por día (secuencial para no saturar)
+  const results = await mapLimit(days, 1, async (day) => warmupDetalleForDay(day));
+
+  const ok = results.filter((x) => x.ok !== false).length;
+  console.log(`[warmup-detalle] done ok=${ok}/${results.length}`);
+  return { ok: true, results };
+}
+
 function toDayIndexUTC(y, m, d) {
   return Math.floor(Date.UTC(y, m - 1, d) / 86400000);
 }
@@ -1220,6 +1294,18 @@ function msUntilNextDailyRun(timeZone, hour, minute) {
   return delay > 0 ? delay : 60_000;
 }
 
+function next9amUtcMs(timeZone) {
+  const now = Date.now();
+  const lp = getLocalParts(new Date(now), timeZone);
+  if (!lp) return now + 60_000;
+
+  const nowMin = lp.hour * 60 + lp.minute;
+  const nineMin = 9 * 60;
+
+  const targetDay = nowMin < nineMin ? lp.date : addDaysISOInTZ(lp.date, timeZone, 1);
+  return utcForLocalTime(timeZone, targetDay, 9, 0);
+}
+
 function scheduleDailyWarmup() {
   if (!WARMUP_ENABLED) return;
 
@@ -1227,23 +1313,49 @@ function scheduleDailyWarmup() {
   console.log(`[warmup@${String(WARMUP_HOUR).padStart(2, "0")}:${String(WARMUP_MINUTE).padStart(2, "0")}] next in ~${Math.round(delay / 60000)} min`);
 
   setTimeout(async () => {
-    try {
-      await warmupLastDaysCaches({ force: WARMUP_FORCE_AT_9 });
-    } catch (e) {
-      console.error("[warmup@daily] fatal:", e?.message || e);
-    } finally {
-      scheduleDailyWarmup();
+  try {
+    // ✅ a las 9am: refresca detalle de HOY
+    if (WARMUP_DETALLE_ENABLED) {
+      await warmupDetalleForDay(getTodayISOInTZ(TZ));
     }
-  }, delay).unref?.();
+
+    // lo demás que ya haces
+    await warmupLastDaysCaches({ force: WARMUP_FORCE_AT_9 });
+
+    if (WARMUP_DETALLE_ENABLED) {
+      const days = lastNDaysBackExcludingTodayISO(WARMUP_DAYS, TZ);
+      await mapLimit(days, 1, (day) => warmupDetalleForDay(day));
+    }
+  } catch (e) {
+    console.error("[warmup@daily] fatal:", e?.message || e);
+  } finally {
+    scheduleDailyWarmup();
+  }
+}, delay).unref?.();
 }
 
 if (WARMUP_ENABLED) {
-  setTimeout(() => {
-    warmupLastDaysCaches({ force: false }).catch(() => { });
+  setTimeout(async () => {
+    try {
+      // ✅ BOOT: calienta DETALLE de HOY (para que el front ya no dispare WL)
+      if (WARMUP_DETALLE_ENABLED) {
+        await warmupDetalleForDay(getTodayISOInTZ(TZ));
+      }
+
+      await warmupLastDaysCaches({ force: false });
+
+      if (WARMUP_DETALLE_ENABLED) {
+        const days = lastNDaysBackExcludingTodayISO(WARMUP_DAYS, TZ);
+        await mapLimit(days, 1, (day) => warmupDetalleForDay(day));
+      }
+    } catch (e) {
+      console.error("[warmup@boot] error:", e?.message || e);
+    }
   }, 2_000).unref?.();
 
   scheduleDailyWarmup();
 }
+
 
 router.post("/warmup/run", async (req, res) => {
   const force = String(req.query.force || "false").toLowerCase() === "true";
@@ -1281,16 +1393,34 @@ function detalleCacheGet(key, dayIso) {
   const hit = detalleUsuarioCache.get(key);
   if (!hit) return null;
 
-  const ttl = detalleTtlForDay(dayIso);
+  // ✅ HOY: válido hasta la próxima 9am (no TTL por minutos)
+  if (isToday(dayIso, TZ)) {
+    const vu = Number(hit.validUntil || 0);
+    if (vu && Date.now() < vu) return hit.data;
+
+    // ya pasó 9am => invalida
+    detalleUsuarioCache.delete(key);
+    return null;
+  }
+
+  // ✅ DÍAS PASADOS: si quieres, déjalo “largo”
+  const ttl = WEEK_CACHE_TTL_MS; // o Infinity si quieres nunca expirar en RAM mientras viva el proceso
   if (Date.now() - (hit.ts || 0) >= ttl) {
     detalleUsuarioCache.delete(key);
     return null;
   }
+
   return hit.data;
 }
 
 function detalleCacheSet(key, dayIso, data) {
-  detalleUsuarioCache.set(key, { data, ts: Date.now() });
+  const validUntil = isToday(dayIso, TZ) ? next9amUtcMs(TZ) : null;
+
+  detalleUsuarioCache.set(key, {
+    data,
+    ts: Date.now(),
+    validUntil,
+  });
 
   const MAX_DETALLE = Number(process.env.MAX_DETALLE_CACHE || 50_000);
   if (detalleUsuarioCache.size > MAX_DETALLE) {
@@ -1658,7 +1788,256 @@ router.get("/prediccion-manana", async (req, res) => {
   }
 });
 
+router.get("/debug/cache/detalle", (req, res) => {
+  const day = String(req.query.day || "").trim() || getTodayISOInTZ(TZ);
+  const entries = [];
+  for (const [key] of detalleUsuarioCache.entries()) {
+    if (String(key).startsWith(day)) entries.push(key);
+  }
+  return res.json({
+    day,
+    total_en_cache: detalleUsuarioCache.size,
+    entradas_del_dia: entries.length,
+    keys_muestra: entries.slice(0, 10),
+  });
+});
+router.get("/debug/warmup-detalle-test", async (req, res) => {
+  const day = String(req.query.day || "").trim() || getTodayISOInTZ(TZ);
+  try {
+    const colaboradoresRaw = await fetchColaboradores(day);
+    const userIds = [...new Set(colaboradoresRaw.map((c) => c?.idAsignee).filter(Boolean))];
+    const usersInfo = await resolveUsersMap(userIds, 4);
+    
+    const todos = userIds.map((id) => ({
+      id,
+      email: usersInfo.get(id)?.email || "",
+      allowed: allowedByEmail(usersInfo.get(id)?.email || ""),
+      excluded: ALL_EXCLUDED_IDS.has(id),
+    }));
+
+    const validUserIds = todos.filter((u) => u.allowed && !u.excluded).map((u) => u.id);
+
+    return res.json({
+      day,
+      total_colaboradores: colaboradoresRaw.length,
+      total_userIds: userIds.length,
+      validos: validUserIds.length,
+      detalle: todos,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e?.message });
+  }
+});
+
+// ✅ DEBUG: ver RAW de un usuario en un día (lo que alimenta tu DETALLE)
+router.get("/debug/raw/user/:userId", (req, res) => {
+  const userId = String(req.params.userId || "").trim();
+  const day = String(req.query.day || "").trim() || getTodayISOInTZ(TZ);
+  if (!userId) return res.status(400).json({ error: "userId requerido" });
+
+  const raw = getDayRaw(day);
+  if (!raw) return res.status(404).json({ day, exists: false });
+
+  const cols = Array.isArray(raw.colaboradoresRaw) ? raw.colaboradoresRaw : [];
+  const col = cols.find((c) => c?.idAsignee === userId) || null;
+
+  if (!col) return res.status(404).json({ day, userId, found: false });
+
+  res.json({
+    day,
+    userId,
+    found: true,
+    colaboradorRaw: col, // aquí está TODO lo que luego se convierte en detalle
+  });
+});
+
+async function procesarDetalleUsuarioDiaFromRaw(userId, day, useBusquedaLogic = false, hours = "all") {
+  const raw = getDayRaw(day);
+  if (!raw?.colaboradoresRaw || !raw?.actividadesById) {
+    return {
+      date: day,
+      user: { user_id: userId, colaborador: userId, email: "", phone: "" },
+      resumen: { actividades: 0, revisiones: 0, revisiones_con_duracion: 0, revisiones_sin_duracion: 0, tiempo_total: 0 },
+      prediccion: null,
+      actividades: [],
+      meta: { fromRaw: true, missingRaw: true, useFechaCreacion: useBusquedaLogic, hours },
+    };
+  }
+
+  const actividadesById = raw.actividadesById;
+  const colaboradores = Array.isArray(raw.colaboradoresRaw) ? raw.colaboradoresRaw : [];
+  const col = colaboradores.find((c) => c?.idAsignee === userId) || null;
+
+  // usuario info (email/nombre) se permite por cache/search (no WL “pesado”)
+  const info = await fetchUserByIdViaSearch(userId);
+
+  if (!col) {
+    return {
+      date: day,
+      user: { user_id: userId, colaborador: info.name || userId, email: info.email || "", phone: info.phone || "" },
+      resumen: { actividades: 0, revisiones: 0, revisiones_con_duracion: 0, revisiones_sin_duracion: 0, tiempo_total: 0 },
+      prediccion: null,
+      actividades: [],
+      meta: { fromRaw: true, noData: true, useFechaCreacion: useBusquedaLogic, hours },
+    };
+  }
+
+  const isCurrentDay = isToday(day, TZ);
+  const userName = resolveUserName(col) || info.name || userId;
+  const acts = safeArray(col?.items?.actividades);
+  const buckets = ["terminadas", "confirmadas", "pendientes"];
+
+  // en modo agenda (useBusquedaLogic=false) filtras por dueStart 9-5
+  const validActIdsHoy = new Set();
+  if (!useBusquedaLogic) {
+    for (const a of acts) {
+      const actId = a?.id;
+      if (!actId) continue;
+
+      const sched = actividadesById.get(actId);
+      if (!sched) continue;
+
+      if (esFtf00secPorTitulo(sched.titulo)) continue;
+
+      const res = isDueStartBetween9and5Local(sched.dueStart, day, TZ);
+      if (res.ok) validActIdsHoy.add(actId);
+    }
+  }
+
+  const actividadesDetalle = [];
+
+  for (const a of acts) {
+    const actId = a?.id;
+    if (!actId) continue;
+
+    const sched = actividadesById.get(actId);
+    const titulo = sched?.titulo || a?.titulo || "";
+
+    if (esFtf00secPorTitulo(titulo)) continue;
+    if (!useBusquedaLogic && !validActIdsHoy.has(actId)) continue;
+
+    const revisiones = { terminadas: [], confirmadas: [], pendientes: [] };
+
+    if (useBusquedaLogic) {
+      // hecho: normalmente solo terminadas
+      const terminadas = safeArray(a?.terminadas);
+      for (const r of terminadas) {
+        if (isCurrentDay && !passRevisionFilterUpToDay(r, day, TZ)) continue;
+        const norm = normalizeRevision(r);
+        if (norm) revisiones.terminadas.push(norm);
+      }
+    } else {
+      // agenda: buckets completos pero filtrando por day<= y no futuro (tu función ya hace eso)
+      for (const b of buckets) {
+        const revs = safeArray(a?.[b]);
+        for (const r of revs) {
+          if (!passRevisionFilterDetalleUpToDay(r, day, TZ, hours)) continue;
+          const norm = normalizeRevision(r);
+          if (norm) revisiones[b].push(norm);
+        }
+      }
+    }
+
+    const total =
+      revisiones.terminadas.length +
+      revisiones.confirmadas.length +
+      revisiones.pendientes.length;
+
+    if (total === 0) continue;
+
+    actividadesDetalle.push({
+      id: actId,
+      titulo,
+      dueStart: sched?.dueStart ?? null,
+      revisiones,
+    });
+  }
+
+  // resumen
+  let revisionesCount = 0;
+  let conDur = 0;
+  let sinDur = 0;
+  let minutos = 0;
+
+  for (const act of actividadesDetalle) {
+    const s = summarizeActividadBuckets(act);
+    revisionesCount += s.revisiones;
+    conDur += s.con_duracion;
+    sinDur += s.sin_duracion;
+    minutos += s.minutos;
+  }
+
+  const features = {
+    actividades: actividadesDetalle.length,
+    revisiones_con_duracion: conDur,
+    revisiones_sin_duracion: sinDur,
+    tiempo_total: minutos,
+  };
+
+  const prediccion = await predecirConModelo(features);
+
+  return {
+    date: day,
+    user: { user_id: userId, colaborador: userName, email: info.email || "", phone: info.phone || "" },
+    resumen: {
+      actividades: features.actividades,
+      revisiones: revisionesCount,
+      revisiones_con_duracion: conDur,
+      revisiones_sin_duracion: sinDur,
+      tiempo_total: minutos,
+    },
+    prediccion,
+    actividades: actividadesDetalle,
+    meta: { fromRaw: true, useFechaCreacion: useBusquedaLogic, isCurrentDay, hours },
+  };
+}
+
+async function upsertDetalleCacheFromRawForUsers({
+  day,
+  userIds,
+  hours = "work",
+  mode = "auto", // "auto" | "agenda" | "hecho"
+}) {
+  if (!day || !Array.isArray(userIds) || userIds.length === 0) {
+    return { ok: false, reason: "missing_args" };
+  }
+
+  const resolvedMode = mode === "auto" ? getDefaultModeForDay(day) : parseMode(mode);
+  const useBusquedaLogic = resolvedMode === "hecho";
+
+  const out = [];
+
+  for (const userId of userIds) {
+    const key = detalleKey(day, userId, useBusquedaLogic, hours, resolvedMode);
+
+    // ✅ reconstruye desde RAW (SIN WL)
+    const detalle = await procesarDetalleUsuarioDiaFromRaw(userId, day, useBusquedaLogic, hours);
+
+    const payload = {
+      ...detalle,
+      meta: {
+        ...(detalle.meta || {}),
+        mode: resolvedMode,
+        cutoffHour: SWITCH_CUTOFF_HOUR,
+        fromCache: false,
+        fromSocket: true,
+        fromRaw: true,
+      },
+    };
+
+    if (canCache(day, TZ)) {
+      detalleCacheSet(key, day, payload);
+    }
+
+    out.push({ userId, key });
+  }
+
+  return { ok: true, day, updated: out.length, keys: out };
+}
+
+router.recomputarFilaUsuario = recomputarFilaUsuario;
+router.updateCachedUsers = updateCachedUsers;
+router.fetchActividades = fetchActividades;
+router.upsertDetalleCacheFromRawForUsers = upsertDetalleCacheFromRawForUsers;
+
 module.exports = router;
-module.exports.recomputarFilaUsuario = recomputarFilaUsuario;
-module.exports.updateCachedUsers = updateCachedUsers;
-module.exports.fetchActividades = fetchActividades;
