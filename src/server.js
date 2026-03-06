@@ -311,6 +311,21 @@ try {
     startWlSocketListener({
       socketUrl,
       handleEvent: async (eventName, payload, meta) => {
+        if (eventName === "revision_eliminada") {
+      console.log(
+        "[REVISION ELIMINADA RAW]\n",
+        JSON.stringify(
+          {
+            eventName,
+            payload,
+            meta,
+            payloadKeys: payload ? Object.keys(payload) : []
+          },
+          null,
+          2
+        )
+      );
+    }
         const revisionId = payload?.id ?? payload?._id ?? null;
 
         const actividadId = Array.isArray(payload?.actividadesRelacionadas)

@@ -146,13 +146,10 @@ function passRevisionFilterUpToDay(rev, dayIso, timeZone) {
   const fc = revisionFechaStr(rev);
   if (!fc) return false;
 
-  // 1) ❌ bloquear futuras vs "ahora"
-  if (!isNotFutureDate(fc)) return false;
-
-  // 2) ✅ permitir si la fecha local CDMX es <= dayIso
   const local = getLocalParts(new Date(fc), timeZone);
   if (!local?.date) return false;
 
+  // ✅ permite cualquier hora, mientras sea del día consultado o anterior
   return isoToDayIndexUTC(local.date) <= isoToDayIndexUTC(dayIso);
 }
 
@@ -170,10 +167,12 @@ function isValidIsoDay(day) {
 function passRevisionFilterTodayOnly(rev, dayIso, timeZone) {
   const fc = revisionFechaStr(rev);
   if (!fc) return false;
-  if (!isNotFutureDate(fc)) return false;
 
   const local = getLocalParts(new Date(fc), timeZone);
-  return !!local && local.date === dayIso;
+  if (!local?.date) return false;
+
+  // ✅ solo misma fecha local, sin comparar hora actual
+  return local.date === dayIso;
 }
 
 
@@ -365,6 +364,50 @@ function isFechaCreacionBetween9and5Local(fechaCreacionStr, day, timeZone) {
 const ftfRegex = /ftf|00sec/i;
 function esFtf00secPorTitulo(titulo) {
   return ftfRegex.test(String(titulo ?? ""));
+}
+
+// ===============================
+// 1) NUEVO helper: precachear ambos modos para HOY usando RAW
+// ===============================
+async function ensureTodayBothModesCachedFromRaw({ day, userId, hours = "work" }) {
+  if (!isToday(day, TZ)) return { ok: true, skipped: true, reason: "not_today" };
+  if (!canCache(day, TZ)) return { ok: true, skipped: true, reason: "cannot_cache" };
+
+  // Asegura que haya RAW
+  const raw = getDayRaw(day);
+  if (!raw?.colaboradoresRaw || !raw?.actividadesById) {
+    return { ok: true, skipped: true, reason: "missing_raw" };
+  }
+
+  // Guarda agenda + hecho (independiente del cutoff)
+  const modes = ["agenda", "hecho"];
+  const updated = [];
+
+  for (const m of modes) {
+    const useBusquedaLogic = m === "hecho";
+    const key = detalleKey(day, userId, useBusquedaLogic, hours, m);
+
+    if (detalleCacheGet(key, day)) continue;
+
+    const detalle = await procesarDetalleUsuarioDiaFromRaw(userId, day, useBusquedaLogic, hours);
+
+    const payload = {
+      ...detalle,
+      meta: {
+        ...(detalle.meta || {}),
+        mode: m,
+        cutoffHour: SWITCH_CUTOFF_HOUR,
+        fromCache: false,
+        autoWarmedOtherMode: true,
+        fromRaw: true,
+      },
+    };
+
+    detalleCacheSet(key, day, payload);
+    updated.push({ mode: m, key });
+  }
+
+  return { ok: true, updated };
 }
 
 // ---- user fetching ----
@@ -825,6 +868,9 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
     fetchUserByIdViaSearch(userId),
   ]);
 
+  setDayRaw(day, { colaboradoresRaw: colaboradores, actividadesById });
+
+
   if (ALL_EXCLUDED_IDS.has(userId)) {
     return {
       date: day,
@@ -1198,29 +1244,40 @@ async function warmupDetalleForDay(day) {
 
     console.log(`[warmup-detalle] ${day} usuarios válidos: ${validUserIds.length}`);
 
-    const useBusquedaLogic = true;
-    const hours = "work"; // ✅ igual que default de la ruta
-    const resolvedMode = "hecho";
+    // siempre fija RAW (por si warmup es lo primero que corre)
+    const actividadesById = await fetchActividades(day);
+    setDayRaw(day, { colaboradoresRaw, actividadesById });
+
+    const hours = "work";
+
+    const isCurrentDay = isToday(day, TZ);
+    const modesToWarm = isCurrentDay ? ["agenda", "hecho"] : ["hecho"];
+
     let ok = 0, bad = 0;
 
-    await mapLimit(validUserIds, WARMUP_DETALLE_CONCURRENCY, async (userId) => {
-      const key = detalleKey(day, userId, useBusquedaLogic, hours, resolvedMode);
-      if (detalleCacheGet(key, day)) { ok++; return; }
+    await mapLimit(validUserIds, WARMUP_DETALLE_CONCURRENCY, async (uid) => {
       try {
-        const detalle = await procesarDetalleUsuarioDia(userId, day, useBusquedaLogic, hours);
-        detalleCacheSet(key, day, {
-          ...detalle,
-          meta: { ...detalle.meta, mode: resolvedMode, cutoffHour: SWITCH_CUTOFF_HOUR, fromCache: false },
-        });
+        for (const m of modesToWarm) {
+          const useBusquedaLogic = m === "hecho";
+          const key = detalleKey(day, uid, useBusquedaLogic, hours, m);
+          if (detalleCacheGet(key, day)) continue;
+
+          const detalle = await procesarDetalleUsuarioDiaFromRaw(uid, day, useBusquedaLogic, hours);
+          const payload = {
+            ...detalle,
+            meta: { ...(detalle.meta || {}), mode: m, cutoffHour: SWITCH_CUTOFF_HOUR, fromCache: false, warmed: true },
+          };
+          detalleCacheSet(key, day, payload);
+        }
         ok++;
       } catch (e) {
-        console.error(`[warmup-detalle] ${day} userId=${userId}:`, e?.message);
+        console.error(`[warmup-detalle] ${day} userId=${uid}:`, e?.message);
         bad++;
       }
     });
 
-    console.log(`[warmup-detalle] ${day} ✅ ok=${ok} bad=${bad} total=${validUserIds.length}`);
-    return { day, ok, bad, total: validUserIds.length };
+    console.log(`[warmup-detalle] ${day} ok=${ok} bad=${bad} total=${validUserIds.length}`);
+    return { day, ok, bad, total: validUserIds.length, modes: modesToWarm };
   } catch (e) {
     console.error(`[warmup-detalle] ${day} error:`, e?.message);
     return { day, ok: false, reason: e?.message };
@@ -1601,15 +1658,13 @@ router.get("/usuario/:userId", async (req, res) => {
     const resolvedMode = mode === "auto" ? getDefaultModeForDay(day) : mode;
 
     const useBusquedaLogic = resolvedMode === "hecho";
-
     const key = detalleKey(day, userId, useBusquedaLogic, hours, resolvedMode);
-
-
-    // ✅ Cache — ya viene limpio desde el origen, no necesita strip
 
     if (canCache(day, TZ)) {
       const cached = detalleCacheGet(key, day);
       if (cached) {
+        // ✅ BONUS: si es HOY y solo existe 1 modo, intenta rellenar el otro sin bloquear
+        void ensureTodayBothModesCachedFromRaw({ day, userId, hours }).catch(() => {});
         return res.json({ ...cached, meta: { ...(cached.meta || {}), fromCache: true } });
       }
     } else {
@@ -1623,10 +1678,14 @@ router.get("/usuario/:userId", async (req, res) => {
       meta: { ...detalle.meta, mode: resolvedMode, cutoffHour: SWITCH_CUTOFF_HOUR, fromCache: false },
     };
 
-
     if (canCache(day, TZ)) {
       detalleCacheSet(key, day, payload);
     }
+
+    // ✅ CLAVE: HOY => guardar también el otro modo automáticamente (desde RAW)
+    void ensureTodayBothModesCachedFromRaw({ day, userId, hours }).catch((e) => {
+      console.error("[ensureTodayBothModesCachedFromRaw] error:", e?.message || e);
+    });
 
     return res.json(payload);
   } catch (err) {
@@ -2039,5 +2098,5 @@ router.recomputarFilaUsuario = recomputarFilaUsuario;
 router.updateCachedUsers = updateCachedUsers;
 router.fetchActividades = fetchActividades;
 router.upsertDetalleCacheFromRawForUsers = upsertDetalleCacheFromRawForUsers;
-
+router.deleteDetalleForDayUser = deleteDetalleForDayUser;
 module.exports = router;
