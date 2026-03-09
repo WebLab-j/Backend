@@ -163,6 +163,12 @@ function removeRevisionFromAllActividades(col, revisionId) {
  * Aplica un evento de borrado de revisión al raw cache del día.
  * Retorna { touchedUserIds: string[], actividadId, revisionId }
  */
+// file: src/realtime/rawStore.js
+
+/**
+ * Aplica un evento de borrado de revisión al raw cache del día.
+ * Retorna { touchedUserIds: string[], actividadId, revisionId }
+ */
 function applyRevisionDeletedEvent(day, payload) {
   const state = getDayRaw(day);
   if (!state) return { touchedUserIds: [], actividadId: null, revisionId: null };
@@ -173,26 +179,73 @@ function applyRevisionDeletedEvent(day, payload) {
   const actividadId = extractActividadId(payload); // puede venir o no
   const userIds = extractUserIds(payload);
 
-  // si no hay userIds, no podemos ubicar colaborador rápido => no-op
-  if (userIds.length === 0) return { touchedUserIds: [], actividadId, revisionId };
+  const cols = Array.isArray(state.colaboradoresRaw) ? state.colaboradoresRaw : [];
+  const touched = new Set();
 
-  for (const uid of userIds) {
-    const col = state.colaboradoresRaw.find((c) => c?.idAsignee === uid);
-    if (!col) continue;
+  const removeInCol = (col) => {
+    if (!col) return false;
 
     if (!col.items) col.items = {};
     if (!Array.isArray(col.items.actividades)) col.items.actividades = [];
 
+    let changed = false;
+
     if (actividadId) {
       const act = col.items.actividades.find((a) => a?.id === actividadId);
-      if (act) removeFromAllBuckets(act, revisionId);
+      if (!act) return false;
+
+      const before =
+        (Array.isArray(act.terminadas) ? act.terminadas.length : 0) +
+        (Array.isArray(act.confirmadas) ? act.confirmadas.length : 0) +
+        (Array.isArray(act.pendientes) ? act.pendientes.length : 0);
+
+      removeFromAllBuckets(act, revisionId);
+
+      const after =
+        (Array.isArray(act.terminadas) ? act.terminadas.length : 0) +
+        (Array.isArray(act.confirmadas) ? act.confirmadas.length : 0) +
+        (Array.isArray(act.pendientes) ? act.pendientes.length : 0);
+
+      changed = after !== before;
     } else {
-      // fallback: buscar y remover en todas las actividades de ese usuario
-      removeRevisionFromAllActividades(col, revisionId);
+      // fallback: buscar y remover en todas las actividades del colaborador
+      const acts = col.items.actividades;
+      for (const act of acts) {
+        if (!act) continue;
+
+        const before =
+          (Array.isArray(act.terminadas) ? act.terminadas.length : 0) +
+          (Array.isArray(act.confirmadas) ? act.confirmadas.length : 0) +
+          (Array.isArray(act.pendientes) ? act.pendientes.length : 0);
+
+        removeFromAllBuckets(act, revisionId);
+
+        const after =
+          (Array.isArray(act.terminadas) ? act.terminadas.length : 0) +
+          (Array.isArray(act.confirmadas) ? act.confirmadas.length : 0) +
+          (Array.isArray(act.pendientes) ? act.pendientes.length : 0);
+
+        if (after !== before) changed = true;
+      }
     }
+
+    if (changed) touched.add(col?.idAsignee);
+    return changed;
+  };
+
+  // ✅ Caso 1: si vienen userIds, tocamos solo esos
+  if (userIds.length > 0) {
+    for (const uid of userIds) {
+      const col = cols.find((c) => c?.idAsignee === uid);
+      removeInCol(col);
+    }
+    return { touchedUserIds: Array.from(touched).filter(Boolean), actividadId, revisionId };
   }
 
-  return { touchedUserIds: userIds, actividadId, revisionId };
+  // ✅ Caso 2 (TU CASO): solo llega {id} => recorremos TODOS
+  for (const col of cols) removeInCol(col);
+
+  return { touchedUserIds: Array.from(touched).filter(Boolean), actividadId, revisionId };
 }
 
 module.exports = {
