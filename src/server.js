@@ -55,6 +55,26 @@ function todayISOInTZ(timeZone = TZ) {
 /**
  * Helpers: ids y días afectados por evento (agenda + hecho)
  */
+
+function userIdsForActividadInRaw(day, actividadId) {
+  if (!day || !actividadId) return [];
+  const raw = getDayRaw(day);
+  const cols = Array.isArray(raw?.colaboradoresRaw) ? raw.colaboradoresRaw : [];
+  const out = new Set();
+
+  for (const col of cols) {
+    const uid = col?.idAsignee;
+    if (!uid) continue;
+
+    const acts = Array.isArray(col?.items?.actividades) ? col.items.actividades : [];
+    if (acts.some((a) => String(a?.id) === String(actividadId))) {
+      out.add(uid);
+    }
+  }
+
+  return Array.from(out);
+}
+
 function extractUserIds(payload) {
   const ids = Array.isArray(payload?.assignees)
     ? payload.assignees.map((a) => a?.id).filter(Boolean)
@@ -523,16 +543,16 @@ try {
         let actividadIdFromPatch = actividadId;
 
         for (const day of daysForPatch) {
-          if (eventName === "revision_creada" || eventName === "revision_actualizada") {
-            const r = applyRevisionEvent(day, payloadForPatch);
-            const touched = Array.isArray(r?.touchedUserIds) ? r.touchedUserIds : [];
-            if (touched.length > 0) touchedByDay.set(day, touched);
-            actividadIdFromPatch = r?.actividadId ?? actividadIdFromPatch;
+  if (eventName === "revision_creada" || eventName === "revision_actualizada") {
+    const r = applyRevisionEvent(day, payloadForPatch);
+    const touched = Array.isArray(r?.touchedUserIds) ? r.touchedUserIds : [];
+    actividadIdFromPatch = r?.actividadId ?? actividadIdFromPatch;
 
-            if (touched.length > 0) {
-              console.log("[RAW PATCH]", { day, eventName, touched, actividadId: actividadIdFromPatch });
-            }
-          }
+    const owners = userIdsForActividadInRaw(day, actividadIdFromPatch || actividadId);
+    const merged = Array.from(new Set([...touched, ...owners]));
+    if (merged.length > 0) touchedByDay.set(day, merged);
+  }
+
 
           if (eventName === "revision_eliminada") {
             const r = applyRevisionDeletedEvent(day, payload);

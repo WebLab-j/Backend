@@ -94,6 +94,7 @@ function stripFutureRevisionsFromDetalle(detalle, dayIso, timeZone = TZ) {
     for (const bucket of ["terminadas", "confirmadas", "pendientes"]) {
       const arr = Array.isArray(revs[bucket]) ? revs[bucket] : [];
       out[bucket] = arr.filter((r) => {
+        if (esRevisionOmitida(r)) return false;
         // ✅ Intenta ambas rutas: objeto normalizado y raw
         const fc = r?.fechaCreacion ?? r?.raw?.fechaCreacion ?? r?.raw?.createdAt ?? r?.createdAt ?? null;
 
@@ -136,6 +137,38 @@ function isOnOrBeforeDayInTZ(dateStr, dayIso, timeZone) {
   const dayIdx = isoToDayIndexUTC(dayIso);
 
   return revIdx <= dayIdx;
+}
+function upsertRevisionById(targetArr, rev) {
+  const norm = normalizeRevision(rev);
+  if (!norm?.id) return;
+  // O(n) pero las listas suelen ser chicas; si quieres optimizar: usa Map.
+  if (targetArr.some((x) => x?.id === norm.id)) return;
+  targetArr.push(norm);
+}
+
+
+function buildActividadRevisionsIndexForActIds(colaboradoresRaw, actIdsSet) {
+  const idx = new Map(); // actId -> { terminadas, confirmadas, pendientes }
+
+  for (const actId of actIdsSet) {
+    idx.set(actId, { terminadas: [], confirmadas: [], pendientes: [] });
+  }
+
+  for (const col of safeArray(colaboradoresRaw)) {
+    for (const act of safeArray(col?.items?.actividades)) {
+      const actId = act?.id;
+      if (!actId || !actIdsSet.has(actId)) continue;
+
+      const entry = idx.get(actId);
+      for (const bucket of ["terminadas", "confirmadas", "pendientes"]) {
+        for (const r of safeArray(act?.[bucket])) {
+          upsertRevisionById(entry[bucket], r); // dedupe por id
+        }
+      }
+    }
+  }
+
+  return idx;
 }
 
 /**
@@ -257,6 +290,91 @@ function passRevisionFilterDetalleSameDay(rev, dayIso, timeZone, hours = "all") 
 }
 
 // ---- domain helpers ----
+
+function notionUrlForRevision(rev) {
+  const id = rev?.id;
+  if (!id) return "";
+  const title = String(rev?.nombre || "revision")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9\-]/g, "");
+  // con o sin slug funciona, pero con slug se ve más bonito
+  return `https://www.notion.so/weblabsmx/${title}-${id}`;
+  // si prefieres corto:
+  // return `https://www.notion.so/${id}`;
+}
+
+function notionPageUrlFromId(id) {
+  const clean = String(id || "").replace(/-/g, "");
+  return clean ? `https://www.notion.so/${clean}` : null;
+}
+
+function passRevisionFilterUpToDay_NoFutureDays(rev, dayIso, timeZone) {
+  const fc = revisionFechaStr(rev);
+  if (!fc) return false;
+
+  const local = getLocalParts(new Date(fc), timeZone);
+  if (!local?.date) return false;
+
+  // ✅ permite mismo día o días pasados, bloquea días futuros
+  return isoToDayIndexUTC(local.date) <= isoToDayIndexUTC(dayIso);
+}
+
+
+function actividadAsignadaPorEmail(sched, userEmail) {
+  if (!sched || !userEmail) return false;
+
+  const email = String(userEmail).trim().toLowerCase();
+  const assignees = Array.isArray(sched.assignees) ? sched.assignees : [];
+
+  return assignees.some((a) => String(a).trim().toLowerCase() === email);
+}
+function actividadAsignadaAUsuario(act, userId) {
+  if (!act || !userId) return false;
+
+  // 1) campos directos comunes
+  const direct =
+    act.idAsignee ??
+    act.idAssignee ??
+    act.assigneeId ??
+    act.asigneeId ??
+    act.userId ??
+    act.ownerId ??
+    null;
+
+  if (direct && String(direct) === String(userId)) return true;
+
+  // 2) listas de asignados a nivel actividad
+  const list =
+    act.assignees ??
+    act.asignees ??
+    act.asignados ??
+    act.assignedTo ??
+    act.assignedUsers ??
+    null;
+
+  if (Array.isArray(list)) {
+    return list.some((x) => {
+      const id = x?.id ?? x?._id ?? x?.userId ?? x;
+      return String(id) === String(userId);
+    });
+  }
+
+  // 3) si tu API trae algo como act.asignee = { id: ... }
+  const obj =
+    act.assignee ??
+    act.asignee ??
+    act.asignado ??
+    null;
+
+  if (obj && typeof obj === "object") {
+    const id = obj.id ?? obj._id ?? obj.userId ?? null;
+    if (id && String(id) === String(userId)) return true;
+  }
+
+  return false;
+}
 
 function domainOf(email) {
   const e = String(email || "").trim().toLowerCase();
@@ -509,10 +627,12 @@ async function fetchActividades(day) {
   for (const a of list) {
     if (!a?.id) continue;
     byId.set(a.id, {
-      id: a.id,
-      dueStart: a.dueStart ?? null,
-      titulo: a.titulo ?? "",
-    });
+  id: a.id,
+  dueStart: a.dueStart ?? null,
+  titulo: a.titulo ?? "",
+  assignees: Array.isArray(a.assignees) ? a.assignees : [], // NECESARIO
+  url: a.url ?? null, // para el botón Notion
+});
   }
 
   actividadesCache.set(day, { byId, ts: now });
@@ -537,45 +657,74 @@ function procesarColaboradorDia_HOY(col, day, actividadesById, email = "") {
 
   const userName = resolveUserName(col);
 
-  const validActIds = new Set();
   let revisiones = 0;
   let revisiones_con_duracion = 0;
   let revisiones_sin_duracion = 0;
   let minutos = 0;
 
-  const acts = Array.isArray(col?.items?.actividades) ? col.items.actividades : [];
+  const actsAll = Array.isArray(col?.items?.actividades) ? col.items.actividades : [];
   const buckets = ["terminadas", "confirmadas", "pendientes"];
 
-  for (const a of acts) {
+  // 1) actividades asignadas al usuario (misma regla que detalle)
+  const acts = actsAll.filter((a) => {
     const actId = a?.id;
-    if (!actId) continue;
+    if (!actId) return false;
 
     const sched = actividadesById.get(actId);
-    if (!sched) continue;
+    if (!sched) return false;
 
-    if (esFtf00secPorTitulo(sched.titulo)) continue;
+    const assignedByEmail = actividadAsignadaPorEmail(sched, email);
+    const assignedFallback = actividadAsignadaAUsuario(a, userId);
+    if (!assignedByEmail && !assignedFallback) return false;
 
+    if (esFtf00secPorTitulo(sched.titulo)) return false;
+
+    // hoy: solo actividades con dueStart 9-5 (como ya tenías)
     const res = isDueStartBetween9and5Local(sched.dueStart, day, TZ);
-    if (!res.ok) continue;
+    if (!res.ok) return false;
 
-    validActIds.add(actId);
+    return true;
+  });
+
+  const validActIds = new Set(acts.map((a) => a?.id).filter(Boolean));
+
+  // 2) índice global de revisiones por actividad (como DETALLE)
+  // OJO: necesitas tener colaboradoresRaw disponible; aquí "col" viene del array de colaboradores de WL.
+  // En tu flujo actual procesarColaboradorDia_HOY recibe "col" solamente, pero NO recibe "colaboradoresRaw".
+  // Así que hay 2 opciones:
+  //   A) pasar colaboradoresRaw como parámetro (recomendado),
+  //   B) reconstruir el índice a partir del RAW store (si ya lo seteaste).
+  //
+  // Te dejo la opción B usando getDayRaw(day) (ya guardas RAW en procesarDia y /hoy cache)
+  const raw = getDayRaw(day);
+  const colaboradoresRaw = Array.isArray(raw?.colaboradoresRaw) ? raw.colaboradoresRaw : [];
+
+  const actividadRevIndex = buildActividadRevisionsIndexForActIds(colaboradoresRaw, validActIds);
+
+  // 3) contar revisiones globales por actividad
+  for (const actId of validActIds) {
+    const global = actividadRevIndex.get(actId);
+    if (!global) continue;
 
     for (const b of buckets) {
-      const revs = Array.isArray(a?.[b]) ? a[b] : [];
-      for (const r of revs) {
-  // ✅ HOY: solo revisiones del mismo día (CDMX) y NO futuras
-  if (!passRevisionFilterUpToDay(r, day, TZ)) continue;
+      for (const r of safeArray(global[b])) {
+        const rawRev = r?.raw || r;
 
-  const dur = Number(r?.duracionMin ?? 0) || 0;
-  revisiones += 1;
+        if (esRevisionOmitida(r)) continue;
 
-  if (dur > 0) {
-    revisiones_con_duracion += 1;
-    minutos += dur;
-  } else {
-    revisiones_sin_duracion += 1;
-  }
-}
+        // ✅ no días futuros (mismo día o pasados; hora no importa)
+        if (!passRevisionFilterUpToDay_NoFutureDays(rawRev, day, TZ)) continue;
+
+        const dur = Number(r?.duracionMin ?? rawRev?.duracionMin ?? 0) || 0;
+        revisiones += 1;
+
+        if (dur > 0) {
+          revisiones_con_duracion += 1;
+          minutos += dur;
+        } else {
+          revisiones_sin_duracion += 1;
+        }
+      }
     }
   }
 
@@ -819,6 +968,23 @@ function safeArray(v) {
   return Array.isArray(v) ? v : [];
 }
 
+const OMIT_REV_REGEX = /(bbibl|biblioteca)/i; // /\bbbibl\b/i
+
+function esRevisionOmitida(revLike) {
+  if (!revLike) return false;
+
+  // si viene normalizada
+  const nombreNorm = revLike?.nombre;
+
+  // si viene raw
+  const raw = revLike?.raw || revLike;
+  const nombreRaw =
+    raw?.nombre ?? raw?.name ?? raw?.titulo ?? raw?.title ?? raw?.activityName ?? "";
+
+  const s = String(nombreNorm || nombreRaw || "");
+  return OMIT_REV_REGEX.test(s);
+}
+
 function normalizeRevision(r) {
   if (!r || typeof r !== "object") return null;
 
@@ -870,67 +1036,36 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
 
   setDayRaw(day, { colaboradoresRaw: colaboradores, actividadesById });
 
+  // NEW: índice global de revisiones por actividad (para “todas las revisiones de la actividad”)
+  
 
-  if (ALL_EXCLUDED_IDS.has(userId)) {
-    return {
-      date: day,
-      user: { user_id: userId, colaborador: "", email: info.email || "", phone: info.phone || "" },
-      actividades: [],
-      resumen: {
-        actividades: 0,
-        revisiones: 0,
-        revisiones_con_duracion: 0,
-        revisiones_sin_duracion: 0,
-        tiempo_total: 0,
-      },
-      prediccion: null,
-      meta: { useFechaCreacion, isCurrentDay, reason: "excluded_id" },
-    };
-  }
-
-  if (!allowedByEmail(info.email || "")) {
-    return {
-      date: day,
-      user: { user_id: userId, colaborador: "", email: info.email || "", phone: info.phone || "" },
-      actividades: [],
-      resumen: {
-        actividades: 0,
-        revisiones: 0,
-        revisiones_con_duracion: 0,
-        revisiones_sin_duracion: 0,
-        tiempo_total: 0,
-      },
-      prediccion: null,
-      meta: { useFechaCreacion, isCurrentDay, reason: "excluded_domain" },
-    };
-  }
+  // ... tu mismo código de filtros/exclusión arriba
 
   const col = colaboradores.find((c) => c?.idAsignee === userId) || null;
-
   if (!col) {
     return {
       date: day,
-      user: {
-        user_id: userId,
-        colaborador: info.name || userId,
-        email: info.email || "",
-        phone: info.phone || "",
-      },
+      user: { user_id: userId, colaborador: info.name || userId, email: info.email || "", phone: info.phone || "" },
       actividades: [],
-      resumen: {
-        actividades: 0,
-        revisiones: 0,
-        revisiones_con_duracion: 0,
-        revisiones_sin_duracion: 0,
-        tiempo_total: 0,
-      },
+      resumen: { actividades: 0, revisiones: 0, revisiones_con_duracion: 0, revisiones_sin_duracion: 0, tiempo_total: 0 },
       prediccion: null,
       meta: { useFechaCreacion, isCurrentDay, reason: "no_data" },
     };
   }
+  const actIdsSet = new Set(safeArray(col?.items?.actividades).map(a => a?.id).filter(Boolean));
+const actividadRevIndex = buildActividadRevisionsIndexForActIds(colaboradores, actIdsSet);
 
   const userName = resolveUserName(col) || info.name || userId;
-  const acts = safeArray(col?.items?.actividades);
+  const userEmail = info.email || "";
+const actsAll = safeArray(col?.items?.actividades);
+
+const acts = actsAll.filter((a) => {
+  const actId = a?.id;
+  if (!actId) return false;
+
+  const sched = actividadesById.get(actId);
+  return actividadAsignadaPorEmail(sched, userEmail);
+});
   const buckets = ["terminadas", "confirmadas", "pendientes"];
 
   const validActIdsHoy = new Set();
@@ -938,28 +1073,13 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
     for (const a of acts) {
       const actId = a?.id;
       if (!actId) continue;
-
       const sched = actividadesById.get(actId);
       if (!sched) continue;
-
       if (esFtf00secPorTitulo(sched.titulo)) continue;
-
       const res = isDueStartBetween9and5Local(sched.dueStart, day, TZ);
       if (res.ok) validActIdsHoy.add(actId);
     }
   }
-
-  const passRevisionFilterPasado = (rev) => {
-    const fc = rev?.fechaCreacion ?? rev?.createdAt ?? null;
-    if (!fc) return false;
-
-    const local = getLocalParts(new Date(fc), TZ);
-    if (!local || local.date !== day) return false;
-
-    if (hours === "work") return isFechaCreacionBetween9and5Local(fc, day, TZ).ok;
-    return true;
-  };
-  void passRevisionFilterPasado;
 
   const actividadesDetalle = [];
 
@@ -975,25 +1095,27 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
 
     const revisiones = { terminadas: [], confirmadas: [], pendientes: [] };
 
+    // ✅ NEW: toma revisiones globales de la actividad
+    const global = actividadRevIndex.get(actId) || { terminadas: [], confirmadas: [], pendientes: [] };
+
     if (useFechaCreacion) {
-      // Modo "hecho" / día pasado: solo terminadas
-      // Si es hoy en modo hecho: filtra futuras. Si es día pasado: acepta todas
-      const terminadas = safeArray(a?.terminadas);
-      for (const r of terminadas) {
-        if (isCurrentDay && !passRevisionFilterUpToDay(r, day, TZ)) continue;
-        const norm = normalizeRevision(r);
-        if (norm) revisiones.terminadas.push(norm);
+      // hecho: usa todas las TERMINADAS de la actividad (global)
+      for (const r of safeArray(global.terminadas)) {
+        const raw = r?.raw || r;
+        if (isCurrentDay && !passRevisionFilterUpToDay(raw, day, TZ)) continue;
+        // r ya es normalizada (viene de index), pero mantenemos formato:
+        if (!esRevisionOmitida(r)) revisiones.terminadas.push(r);
       }
     } else {
-  for (const b of buckets) {
-    const revs = safeArray(a?.[b]);
-    for (const r of revs) {
-      if (!passRevisionFilterDetalleUpToDay(r, day, TZ)) continue;
-      const norm = normalizeRevision(r);
-      if (norm) revisiones[b].push(norm);
+      // agenda: usa buckets completos (global) con tu filtro por day<= y no futuro
+      for (const b of buckets) {
+        for (const r of safeArray(global[b])) {
+          const raw = r?.raw || r;
+          if (!passRevisionFilterDetalleUpToDay(raw, day, TZ, hours)) continue;
+          if (!esRevisionOmitida(r)) revisiones[b].push(r);
+        }
+      }
     }
-  }
-}
 
     const total =
       revisiones.terminadas.length +
@@ -1006,11 +1128,12 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
       id: actId,
       titulo,
       dueStart: sched?.dueStart ?? null,
+      notionUrl: sched?.url ?? notionPageUrlFromId(actId),
       revisiones,
     });
   }
 
-  // ✅ El resumen se calcula SOBRE los datos ya filtrados
+  // ... tu resumen/prediccion igual (ya contará revisiones globales)
   let revisionesCount = 0;
   let conDur = 0;
   let sinDur = 0;
@@ -1033,7 +1156,6 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
 
   const prediccion = await predecirConModelo(features);
 
-  // ✅ Todo ya está filtrado desde el origen — no necesitas un segundo paso
   return {
     date: day,
     user: { user_id: userId, colaborador: userName, email: info.email || "", phone: info.phone || "" },
@@ -1045,8 +1167,8 @@ async function procesarDetalleUsuarioDia(userId, day, useBusquedaLogic = false, 
       tiempo_total: minutos,
     },
     prediccion,
-    actividades: actividadesDetalle, // ✅ ya limpio desde el loop
-    meta: { useFechaCreacion, isCurrentDay, hours },
+    actividades: actividadesDetalle,
+    meta: { useFechaCreacion, isCurrentDay, hours, includeAllActivityRevisions: true },
   };
 }
 
@@ -1924,10 +2046,9 @@ async function procesarDetalleUsuarioDiaFromRaw(userId, day, useBusquedaLogic = 
   }
 
   const actividadesById = raw.actividadesById;
-  const colaboradores = Array.isArray(raw.colaboradoresRaw) ? raw.colaboradoresRaw : [];
-  const col = colaboradores.find((c) => c?.idAsignee === userId) || null;
+  const colaboradores = safeArray(raw.colaboradoresRaw);
 
-  // usuario info (email/nombre) se permite por cache/search (no WL “pesado”)
+  const col = colaboradores.find((c) => c?.idAsignee === userId) || null;
   const info = await fetchUserByIdViaSearch(userId);
 
   if (!col) {
@@ -1940,24 +2061,34 @@ async function procesarDetalleUsuarioDiaFromRaw(userId, day, useBusquedaLogic = 
       meta: { fromRaw: true, noData: true, useFechaCreacion: useBusquedaLogic, hours },
     };
   }
+    
+
 
   const isCurrentDay = isToday(day, TZ);
   const userName = resolveUserName(col) || info.name || userId;
-  const acts = safeArray(col?.items?.actividades);
+  const userEmail = info.email || "";
+const actsAll = safeArray(col?.items?.actividades);
+
+const acts = actsAll.filter((a) => {
+  const actId = a?.id;
+  if (!actId) return false;
+
+  const sched = actividadesById.get(actId);
+  return actividadAsignadaPorEmail(sched, userEmail);
+});
+
+const actIdsSet = new Set(acts.map(a => a?.id).filter(Boolean));
+const actividadRevIndex = buildActividadRevisionsIndexForActIds(colaboradores, actIdsSet);
   const buckets = ["terminadas", "confirmadas", "pendientes"];
 
-  // en modo agenda (useBusquedaLogic=false) filtras por dueStart 9-5
   const validActIdsHoy = new Set();
   if (!useBusquedaLogic) {
     for (const a of acts) {
       const actId = a?.id;
       if (!actId) continue;
-
       const sched = actividadesById.get(actId);
       if (!sched) continue;
-
       if (esFtf00secPorTitulo(sched.titulo)) continue;
-
       const res = isDueStartBetween9and5Local(sched.dueStart, day, TZ);
       if (res.ok) validActIdsHoy.add(actId);
     }
@@ -1976,23 +2107,20 @@ async function procesarDetalleUsuarioDiaFromRaw(userId, day, useBusquedaLogic = 
     if (!useBusquedaLogic && !validActIdsHoy.has(actId)) continue;
 
     const revisiones = { terminadas: [], confirmadas: [], pendientes: [] };
+    const global = actividadRevIndex.get(actId) || { terminadas: [], confirmadas: [], pendientes: [] };
 
     if (useBusquedaLogic) {
-      // hecho: normalmente solo terminadas
-      const terminadas = safeArray(a?.terminadas);
-      for (const r of terminadas) {
-        if (isCurrentDay && !passRevisionFilterUpToDay(r, day, TZ)) continue;
-        const norm = normalizeRevision(r);
-        if (norm) revisiones.terminadas.push(norm);
+      for (const r of safeArray(global.terminadas)) {
+        const rawRev = r?.raw || r;
+        if (isCurrentDay && !passRevisionFilterUpToDay(rawRev, day, TZ)) continue;
+        if (!esRevisionOmitida(r)) revisiones.terminadas.push(r);
       }
     } else {
-      // agenda: buckets completos pero filtrando por day<= y no futuro (tu función ya hace eso)
       for (const b of buckets) {
-        const revs = safeArray(a?.[b]);
-        for (const r of revs) {
-          if (!passRevisionFilterDetalleUpToDay(r, day, TZ, hours)) continue;
-          const norm = normalizeRevision(r);
-          if (norm) revisiones[b].push(norm);
+        for (const r of safeArray(global[b])) {
+          const rawRev = r?.raw || r;
+          if (!passRevisionFilterDetalleUpToDay(rawRev, day, TZ, hours)) continue;
+          if (!esRevisionOmitida(r)) revisiones[b].push(r);
         }
       }
     }
@@ -2012,7 +2140,6 @@ async function procesarDetalleUsuarioDiaFromRaw(userId, day, useBusquedaLogic = 
     });
   }
 
-  // resumen
   let revisionesCount = 0;
   let conDur = 0;
   let sinDur = 0;
@@ -2047,7 +2174,7 @@ async function procesarDetalleUsuarioDiaFromRaw(userId, day, useBusquedaLogic = 
     },
     prediccion,
     actividades: actividadesDetalle,
-    meta: { fromRaw: true, useFechaCreacion: useBusquedaLogic, isCurrentDay, hours },
+    meta: { fromRaw: true, useFechaCreacion: useBusquedaLogic, isCurrentDay, hours, includeAllActivityRevisions: true },
   };
 }
 
